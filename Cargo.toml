@@ -1,0 +1,20 @@
+[package]
+name = "monika"
+version = "0.1.0"
+edition = "2024"
+description = "Inspectable links between documents, code, and data"
+publish = false
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+ignore = "0.4"
+globset = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
+sha2 = "0.10"
+url = "2"
+tempfile = "3"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
