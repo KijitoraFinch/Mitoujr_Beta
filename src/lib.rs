@@ -5,6 +5,7 @@ pub mod extension_test;
 pub mod extensions;
 pub mod graph;
 pub mod model;
+mod observations;
 pub mod operations;
 pub mod query;
 pub mod workspace;

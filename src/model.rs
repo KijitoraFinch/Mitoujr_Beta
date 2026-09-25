@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -184,7 +184,9 @@ pub struct Snapshot {
     pub failures: BTreeMap<String, Diagnostic>,
     pub sources: Option<Vec<SnapshotSource>>,
     pub diagnostics: Vec<Diagnostic>,
-    pub resolution_inputs: BTreeMap<String, Vec<String>>,
+    /// Resource addresses actually requested by each selector, including absence
+    /// and acquisition failures. Metadata and contents are stored once per session.
+    pub resolution_reads: BTreeMap<String, BTreeSet<String>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

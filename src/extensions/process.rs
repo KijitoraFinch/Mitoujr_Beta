@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::process::{ChildStdin, ChildStdout, Command};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout, timeout_at};
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -40,8 +40,8 @@ impl Manifest {
         );
         if self.supports("resolve") {
             ensure!(
-                self.supports("dependencies") && self.supports("compare"),
-                "a region extension must provide dependencies, resolve, and compare"
+                self.supports("compare"),
+                "a region extension must provide resolve and compare"
             );
             ensure!(
                 !self.domains.is_empty(),
@@ -79,6 +79,7 @@ impl Manifest {
 enum Response {
     Success(Success),
     Failure(Failure),
+    Read(ReadRequest),
 }
 
 #[derive(Deserialize)]
@@ -95,6 +96,25 @@ struct Failure {
     protocol: u32,
     id: u64,
     error: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReadRequest {
+    protocol: u32,
+    id: u64,
+    read: Vec<String>,
+}
+
+pub(crate) enum ResolutionEvent {
+    Read(Vec<String>),
+    Complete(Value),
+}
+
+enum State {
+    Ready,
+    Resolving { id: u64, deadline: Instant },
+    Unavailable(String),
 }
 
 /// Owns every extension started by one CLI operation, including historical and
@@ -174,7 +194,8 @@ pub struct Worker {
     root: PathBuf,
     timeout: Duration,
     next_id: u64,
-    failed: Option<String>,
+    state: State,
+    termination_started: bool,
     stopped: bool,
 }
 
@@ -211,86 +232,190 @@ impl Worker {
             root: root.to_owned(),
             timeout: Duration::from_millis(extension.timeout_ms),
             next_id: 1,
-            failed: None,
+            state: State::Ready,
+            termination_started: false,
             stopped: false,
         })
     }
 
-    pub async fn invoke(&mut self, operation: &str, input: Value) -> Result<Value> {
-        if let Some(error) = &self.failed {
+    fn ready(&self) -> Result<()> {
+        self.available()?;
+        ensure!(
+            matches!(self.state, State::Ready),
+            "extension has a pending resolution"
+        );
+        Ok(())
+    }
+
+    fn available(&self) -> Result<()> {
+        if let State::Unavailable(error) = &self.state {
             bail!("extension worker is unavailable: {error}");
         }
         ensure!(!self.stopped, "extension worker is stopped");
         ensure!(self.stdin.is_some(), "extension worker is shutting down");
+        Ok(())
+    }
+
+    fn request(&mut self, operation: &str, input: Value) -> (u64, Value) {
         let id = self.next_id;
         self.next_id += 1;
-        let mut request = serde_json::to_vec(&json!({
-            "protocol": 1, "id": id, "operation": operation, "workspace": self.root, "input": input,
-        }))?;
-        request.push(b'\n');
-        // Dropping this future can leave a partially sent request or an unread
-        // response. Only a validated response permits another request.
-        self.failed = Some(format!(
-            "extension operation {operation} was cancelled during communication"
-        ));
-        let response: Result<Response> = async {
-            let exchange = async {
-                let stdin = self.stdin.as_mut().expect("live worker stdin");
-                stdin
-                    .write_all(&request)
-                    .await
-                    .context("send extension request")?;
-                let line = self
-                    .stdout
-                    .next()
-                    .await
-                    .context("extension closed stdout without a response")?
-                    .context("read extension response")?;
-                let response: Response =
-                    serde_json::from_str(&line).context("invalid extension response")?;
-                let (protocol, response_id) = match &response {
-                    Response::Success(result) => (result.protocol, result.id),
-                    Response::Failure(result) => (result.protocol, result.id),
-                };
-                require_version(protocol)?;
-                ensure!(
-                    response_id == id,
-                    "extension response ID mismatch: expected {id}, received {response_id}"
-                );
-                Ok(response)
-            };
-            timeout(self.timeout, exchange).await.with_context(|| {
-                format!(
-                    "extension operation {operation} timed out after {} ms",
-                    self.timeout.as_millis()
-                )
-            })?
+        (
+            id,
+            json!({
+                "protocol": 1, "id": id, "operation": operation, "workspace": self.root, "input": input,
+            }),
+        )
+    }
+
+    pub async fn invoke(&mut self, operation: &str, input: Value) -> Result<Value> {
+        self.ready()?;
+        self.invoke_inner(operation, input).await
+    }
+
+    // A resolver awaiting a read must also serve observe when it is the provider.
+    pub(crate) async fn observe(&mut self, resource: &str) -> Result<Value> {
+        self.available()?;
+        self.invoke_inner("observe", json!({"resource": resource}))
+            .await
+    }
+
+    async fn invoke_inner(&mut self, operation: &str, input: Value) -> Result<Value> {
+        let (id, request) = self.request(operation, input);
+        let mut deadline = Instant::now() + self.timeout;
+        if let State::Resolving {
+            deadline: outer, ..
+        } = self.state
+        {
+            deadline = deadline.min(outer);
         }
-        .await;
+        match self
+            .exchange(operation, request, id, deadline, false)
+            .await?
+        {
+            Response::Success(result) => Ok(result.result),
+            Response::Failure(error) => bail!("extension operation {operation}: {}", error.error),
+            Response::Read(_) => unreachable!("read requests are rejected outside resolve"),
+        }
+    }
+
+    pub(crate) async fn resolve(&mut self, selector: Value) -> Result<ResolutionEvent> {
+        self.ready()?;
+        let (id, request) = self.request("resolve", json!({"selector": selector}));
+        let deadline = Instant::now() + self.timeout;
+        self.state = State::Resolving { id, deadline };
+        let response = self
+            .exchange("resolve", request, id, deadline, true)
+            .await?;
+        self.resolution_event(response)
+    }
+
+    pub(crate) async fn resume(
+        &mut self,
+        observations: std::result::Result<Vec<Value>, String>,
+    ) -> Result<ResolutionEvent> {
+        self.available()?;
+        let State::Resolving { id, deadline } = self.state else {
+            bail!("extension has no pending observation request");
+        };
+        let response = match observations {
+            Ok(observations) => json!({"protocol": 1, "id": id, "read_result": observations}),
+            Err(error) => json!({"protocol": 1, "id": id, "read_error": error}),
+        };
+        let response = self
+            .exchange("resolve", response, id, deadline, true)
+            .await?;
+        self.resolution_event(response)
+    }
+
+    fn resolution_event(&mut self, response: Response) -> Result<ResolutionEvent> {
         match response {
-            Ok(Response::Success(Success { result, .. })) => {
-                self.failed = None;
-                Ok(result)
+            Response::Read(request) => Ok(ResolutionEvent::Read(request.read)),
+            Response::Success(response) => {
+                self.state = State::Ready;
+                Ok(ResolutionEvent::Complete(response.result))
             }
-            Ok(Response::Failure(Failure { error, .. })) => {
-                self.failed = None;
-                bail!("extension operation {operation}: {error}")
-            }
-            Err(error) => {
-                self.failed = Some(format!("{error:#}"));
-                let cleanup = self.shutdown(true).await;
-                let stderr = tokio::fs::read(self.stderr.path())
-                    .await
-                    .context("read extension stderr")?;
-                let mut message =
-                    format!("{error:#}; stderr: {}", String::from_utf8_lossy(&stderr));
-                if let Err(error) = cleanup {
-                    message.push_str(&format!("; cleanup: {error:#}"));
-                }
-                self.failed = Some(message.clone());
-                bail!(message)
+            Response::Failure(response) => {
+                self.state = State::Ready;
+                bail!("extension operation resolve: {}", response.error)
             }
         }
+    }
+
+    async fn exchange(
+        &mut self,
+        operation: &str,
+        message: Value,
+        id: u64,
+        deadline: Instant,
+        allow_reads: bool,
+    ) -> Result<Response> {
+        let mut request = serde_json::to_vec(&message)?;
+        request.push(b'\n');
+        // Only a complete, validated frame restores the previous state. Dropping
+        // this future leaves the worker unavailable, including in a nested call.
+        let previous = std::mem::replace(
+            &mut self.state,
+            State::Unavailable(format!(
+                "extension operation {operation} was cancelled during communication"
+            )),
+        );
+        let response = timeout_at(deadline, async {
+            self.stdin
+                .as_mut()
+                .expect("live worker stdin")
+                .write_all(&request)
+                .await
+                .context("send extension request")?;
+            let line = self
+                .stdout
+                .next()
+                .await
+                .context("extension closed stdout without a response")?
+                .context("read extension response")?;
+            let response: Response =
+                serde_json::from_str(&line).context("invalid extension response")?;
+            let (protocol, response_id) = match &response {
+                Response::Success(result) => (result.protocol, result.id),
+                Response::Failure(result) => (result.protocol, result.id),
+                Response::Read(result) => (result.protocol, result.id),
+            };
+            require_version(protocol)?;
+            ensure!(
+                response_id == id,
+                "extension response ID mismatch: expected {id}, received {response_id}"
+            );
+            ensure!(
+                allow_reads || !matches!(response, Response::Read(_)),
+                "observation requests are only valid during resolve"
+            );
+            Ok::<_, anyhow::Error>(response)
+        })
+        .await
+        .with_context(|| format!("extension operation {operation} timed out"));
+        match response.and_then(|response| response) {
+            Ok(response) => {
+                self.state = previous;
+                Ok(response)
+            }
+            Err(error) => Err(self.invalidate(error).await),
+        }
+    }
+
+    pub(crate) async fn invalidate(&mut self, error: anyhow::Error) -> anyhow::Error {
+        self.state = State::Unavailable(format!("{error:#}"));
+        let cleanup = self.shutdown(true).await;
+        let mut message = format!("{error:#}");
+        match tokio::fs::read(self.stderr.path()).await {
+            Ok(stderr) => {
+                message.push_str(&format!("; stderr: {}", String::from_utf8_lossy(&stderr)))
+            }
+            Err(error) => message.push_str(&format!("; read extension stderr: {error}")),
+        }
+        if let Err(error) = cleanup {
+            message.push_str(&format!("; cleanup: {error:#}"));
+        }
+        self.state = State::Unavailable(message.clone());
+        anyhow::anyhow!(message)
     }
 
     pub async fn describe(&mut self, name: &str, revision: &str) -> Result<Manifest> {
@@ -312,19 +437,26 @@ impl Worker {
         }
         .await;
         if let Err(error) = &result {
-            self.failed = Some(format!("{error:#}"));
+            self.state = State::Unavailable(format!("{error:#}"));
         }
         result
     }
 
     fn start_kill(&mut self) -> Result<()> {
+        // Cleanup can be cancelled by the enclosing operation's deadline and
+        // resumed by the host. Signal the owned group once, then only reap it.
+        if self.termination_started {
+            return Ok(());
+        }
         match self.child.start_kill() {
             Ok(()) => Ok(()),
             // The group may already have exited between EOF and cleanup.
             #[cfg(unix)]
             Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ESRCH as i32) => Ok(()),
             Err(error) => Err(error).context("terminate extension process group"),
-        }
+        }?;
+        self.termination_started = true;
+        Ok(())
     }
 
     pub async fn shutdown(&mut self, interrupted: bool) -> Result<()> {
@@ -332,7 +464,7 @@ impl Worker {
             return Ok(());
         }
         self.stdin.take();
-        let graceful = !interrupted && self.failed.is_none();
+        let graceful = !interrupted && matches!(self.state, State::Ready);
         let mut expired = false;
         let status = if graceful {
             match timeout(SHUTDOWN_GRACE, self.child.wait()).await {

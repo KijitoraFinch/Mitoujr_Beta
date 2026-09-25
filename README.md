@@ -26,6 +26,8 @@ JSONのデータ行を領域として扱い、別のsidecarにリンクと注釈
 
 通常のCLIとしてインストールする場合は `cargo install --path . --locked` を使う。
 外部拡張の作成・登録方法は [EXTENSIONS.md](EXTENSIONS.md) を参照。
+解決拡張は必要な資源の固定済み観測を要求でき、その内容から次の資源を探索できる。
+Pythonで作る場合は [通信ヘルパー](examples/extension_api.py)の `context.read` / `read_many` を利用できる。
 
 ## 操作
 

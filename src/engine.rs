@@ -1,3 +1,4 @@
+use crate::extensions::process::ResolutionEvent;
 use crate::extensions::{
     Extraction,
     process::{self, Manifest},
@@ -5,11 +6,13 @@ use crate::extensions::{
 use crate::model::{
     Diagnostic, Observation, Region, Relation, ResourceState, Selector, SnapshotSource,
 };
+use crate::observations::ReadScope;
 use crate::workspace::Session;
 use anyhow::{Context, Result, bail, ensure};
 use globset::Glob;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 use url::Url;
 
 pub struct Engine<'host> {
@@ -122,8 +125,15 @@ impl<'host> Engine<'host> {
                 .find(|(_, config)| config.schemes.iter().any(|scheme| scheme == url.scheme()))
                 .map(|(name, _)| name.clone())
                 .with_context(|| format!("no resource provider for scheme {}", url.scheme()))?;
+            ensure!(
+                self.manifest(&name).await?.supports("observe"),
+                "extension {name} does not support observe"
+            );
+            let config = &self.session.workspace.config.extensions[&name];
             let result = self
-                .call(&name, "observe", json!({"resource": resource}))
+                .host
+                .worker(&self.session.workspace.root, &name, config)?
+                .observe(&resource)
                 .await?;
             #[derive(serde::Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -158,43 +168,6 @@ impl<'host> Engine<'host> {
         )
     }
 
-    pub async fn observations_input(&mut self) -> Result<Vec<Value>> {
-        let observations: Vec<_> = self
-            .session
-            .snapshot
-            .observations
-            .values()
-            .cloned()
-            .collect();
-        let mut inputs = Vec::with_capacity(observations.len());
-        for observation in &observations {
-            inputs.push(self.observation_input(observation).await?);
-        }
-        Ok(inputs)
-    }
-
-    async fn resolution_observations(&mut self, ids: &[String]) -> Result<Vec<Value>> {
-        let observations: Vec<_> = ids
-            .iter()
-            .map(|id| {
-                self.session
-                    .snapshot
-                    .observations
-                    .values()
-                    .find(|observation| &observation.id == id)
-                    .cloned()
-                    .with_context(|| {
-                        format!("resolution input refers to an unknown observation {id}")
-                    })
-            })
-            .collect::<Result<_>>()?;
-        let mut inputs = Vec::with_capacity(observations.len());
-        for observation in &observations {
-            inputs.push(self.observation_input(observation).await?);
-        }
-        Ok(inputs)
-    }
-
     pub async fn resolve(&mut self, selector: &Selector) -> Result<Region> {
         let key = serde_json::to_string(&selector)?;
         if let Some(result) = self.resolutions.get(&key) {
@@ -215,71 +188,84 @@ impl<'host> Engine<'host> {
             "extension {} does not resolve regions",
             selector.extension
         );
-        // Dependencies may use observations from an earlier round to discover another resource.
-        // Each round freezes newly requested resources before interpreting them.
         let key = serde_json::to_string(selector)?;
-        let ids = if let Some(ids) = self.session.snapshot.resolution_inputs.get(&key) {
-            ids.clone()
-        } else {
-            loop {
-                let observations = self.observations_input().await?;
-                let resources: Vec<String> = serde_json::from_value(
-                    self.call(
-                        &selector.extension,
-                        "dependencies",
-                        json!({"selector": selector, "observations": observations}),
-                    )
-                    .await?,
-                )
-                .context("dependencies result must be a resource array")?;
-                let before = self.session.snapshot.observations.len();
-                for resource in resources {
-                    let observation = self.observe(&resource).await?;
-                    ensure!(
-                        observation.state.exists,
-                        "resource does not exist: {}",
-                        observation.resource
-                    );
-                }
-                if self.session.snapshot.observations.len() == before {
-                    break;
+        let mut scope = ReadScope::new(self.session.snapshot.resolution_reads.get(&key).cloned());
+        let config = self.session.workspace.config.extensions[&selector.extension].clone();
+        // This deadline covers the whole interpretation, including nested reads
+        // served by other processes. A sequence of reads cannot reset it.
+        let result = tokio::time::timeout(
+            Duration::from_millis(config.timeout_ms),
+            self.resolve_with_reads(selector, &mut scope),
+        )
+        .await;
+        self.session
+            .snapshot
+            .resolution_reads
+            .entry(key)
+            .or_insert_with(|| scope.resources.clone());
+        let result = match result {
+            Ok(result) => result?,
+            Err(_) => {
+                let error = anyhow::anyhow!(
+                    "extension operation resolve timed out after {} ms",
+                    config.timeout_ms
+                );
+                return Err(self
+                    .host
+                    .worker(&self.session.workspace.root, &selector.extension, &config)?
+                    .invalidate(error)
+                    .await);
+            }
+        };
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Resolved {
+            domain: String,
+            #[serde(default)]
+            equivalence_key: Option<String>,
+            identity: Value,
+            content: Value,
+        }
+        let result: Resolved = serde_json::from_value(result).context("invalid region result")?;
+        ensure!(
+            manifest.domains.contains(&result.domain),
+            "extension returned an undeclared comparison domain: {}",
+            result.domain
+        );
+        Ok(Region {
+            domain: result.domain,
+            equivalence_key: result.equivalence_key,
+            identity: result.identity,
+            content: result.content,
+            observations: scope.finish()?,
+        })
+    }
+
+    async fn resolve_with_reads(
+        &mut self,
+        selector: &Selector,
+        scope: &mut ReadScope,
+    ) -> Result<Value> {
+        let root = self.session.workspace.root.clone();
+        let config = self.session.workspace.config.extensions[&selector.extension].clone();
+        let mut event = self
+            .host
+            .worker(&root, &selector.extension, &config)?
+            .resolve(serde_json::to_value(selector)?)
+            .await?;
+        loop {
+            match event {
+                ResolutionEvent::Complete(region) => return Ok(region),
+                ResolutionEvent::Read(resources) => {
+                    let observations = scope.read(self, resources).await;
+                    event = self
+                        .host
+                        .worker(&root, &selector.extension, &config)?
+                        .resume(observations)
+                        .await?;
                 }
             }
-            let ids: Vec<_> = self
-                .session
-                .snapshot
-                .observations
-                .values()
-                .map(|o| o.id.clone())
-                .collect();
-            self.session
-                .snapshot
-                .resolution_inputs
-                .insert(key, ids.clone());
-            ids
-        };
-        let observations = self.resolution_observations(&ids).await?;
-        let region: Region = serde_json::from_value(
-            self.call(
-                &selector.extension,
-                "resolve",
-                json!({"selector": selector, "observations": observations}),
-            )
-            .await?,
-        )
-        .context("invalid region result")?;
-        ensure!(
-            manifest.domains.contains(&region.domain),
-            "extension returned an undeclared comparison domain: {}",
-            region.domain
-        );
-        for id in &region.observations {
-            ensure!(
-                ids.contains(id),
-                "region depends on an observation outside its inputs: {id}"
-            );
         }
-        Ok(region)
     }
 
     pub async fn compare(&mut self, left: &Region, right: &Region) -> Result<Relation> {

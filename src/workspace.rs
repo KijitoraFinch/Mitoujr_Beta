@@ -324,6 +324,15 @@ impl Workspace {
                 "snapshot has both success and failure for {resource}"
             );
         }
+        for resources in snapshot.resolution_reads.values() {
+            for resource in resources {
+                ensure!(
+                    snapshot.observations.contains_key(resource)
+                        || snapshot.failures.contains_key(resource),
+                    "resolution refers to an unrecorded resource: {resource}"
+                );
+            }
+        }
         Ok(snapshot)
     }
 }
@@ -355,7 +364,7 @@ impl Session {
             failures: BTreeMap::new(),
             sources: None,
             diagnostics: Vec::new(),
-            resolution_inputs: BTreeMap::new(),
+            resolution_reads: BTreeMap::new(),
         };
         Ok(Self {
             workspace,

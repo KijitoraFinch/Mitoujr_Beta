@@ -2,8 +2,8 @@
 
 拡張は、JSON LinesでCoreと通信する独立した実行プログラム。
 CLIの一回の実行中は、プロジェクトルート・拡張名・登録設定が同じプロセスを、
-過去の観測や書き込み後の観測を扱う場合も再利用する。標準入力の各行に対して、
-標準出力へJSONを一行返してflushする。ログは標準エラーへ出力する。
+過去の観測や書き込み後の観測を扱う場合も再利用する。各メッセージを標準入力・標準出力の
+JSON一行でやり取りし、送信時にflushする。ログは標準エラーへ出力する。
 
 観測・書き込み以外の操作は、渡された固定済みの観測・設定・入力から結果を計算する。
 資源の現在の内容を読む操作は `observe`、書き込む操作は `commit` が担当する。
@@ -58,10 +58,11 @@ selectorの解決に必要な資源は、これらの抽出元に含まれなく
 {"protocol":1,"id":1,"workspace":"/project","operation":"describe","input":null}
 ```
 
-応答は同じ `id` を持ち、`result` または `error` のどちらかを返す。`result:null` も表現できる。
+操作の最終応答は同じ `id` を持ち、`result` または `error` のどちらかを返す。
+`result:null` も表現できる。`resolve` の途中では、下記の観測要求を送れる。
 
 ```json
-{"protocol":1,"id":1,"result":{"name":"sets","revision":"test-v1","operations":["observe","dependencies","resolve","compare","extract","edit","commit","check_plan","check"],"domains":["test.sets.v1"],"description":"JSON row sets and sidecars"}}
+{"protocol":1,"id":1,"result":{"name":"sets","revision":"test-v1","operations":["observe","resolve","compare","extract","edit","commit","check_plan","check"],"domains":["test.sets.v1"],"description":"JSON row sets and sidecars"}}
 ```
 
 ```json
@@ -69,12 +70,13 @@ selectorの解決に必要な資源は、これらの抽出元に含まれなく
 ```
 
 `describe` が返す名前・revisionは登録内容と一致すること。regionを扱う拡張は
-`dependencies`・`resolve`・`compare` を提供し、返す領域のdomainを宣言する。
+`resolve`・`compare` を提供し、返す領域のdomainを宣言する。
 他の機能も `operations` に列挙した操作だけが呼び出せる。
 
 timeoutは入力送信から応答取得までの全体に適用する。不正な応答、終了、timeout、途中のキャンセルで通信が壊れた場合は
 そのプロセスへの呼び出しを失敗させ、自動再起動・再試行をしない。
 通常の `error` 応答はその操作の失敗として扱う。
+`resolve` の期限には観測の要求と提供元の呼び出しも含まれ、往復のたびに期限を延長しない。
 
 通常終了ではCoreが標準入力を閉じる。拡張はEOFを受けて1秒以内に終了する。
 期限超過・中断・通信破損では、Coreが拡張のプロセス群を終了させ、終了結果を回収する。
@@ -115,33 +117,70 @@ selectorの形は `{"extension":"name","resource":"任意の指定","query":任�
 `resource` は省略でき、`query` の省略値は `null`。
 Coreはselectorの内容を解釈せず、指定された拡張へ渡す。
 
-`dependencies` のinput:
+`resolve` のinputはselectorだけを持つ。
 
 ```json
-{"selector":{"extension":"sets","query":{"resources":["file:///project/a.json"]}},"observations":[]}
+{"selector":{"extension":"sets","query":{"resources":["file:///project/a.json"]}}}
 ```
 
-返す値は必要なResource URIの配列。Coreが新たに観測した後、固定済み観測を含めて再度呼ぶ。
-新しい資源が要求されなくなったら解決へ進む。観測内容から次の依存資源を発見できる。
-解決に必要な資源が不存在・取得失敗なら、Coreがその理由を保持して解決を失敗させる。
-
-`resolve` にも `selector` と `observations` を渡す。返すRegionの例:
+拡張は必要な観測を、解決要求と同じ `id` の `read` メッセージで要求する。
+値はResource URIの配列で、Coreは同じ順序の観測を `read_result` に入れて返す。
+一つの観測要求の応答を受け取ってから、次の要求を送る。
 
 ```json
-{"domain":"test.sets.v1","identity":[["observation-id",0]],"observations":["observation-id"],"content":{"count":1}}
+{"protocol":1,"id":2,"read":["file:///project/a.json"]}
+```
+
+```json
+{"protocol":1,"id":2,"read_result":[{"observation":{"id":"...","resource":"file:///project/a.json","content_hash":"...","size":3,"observed_at":"...","provider":"sets","state":{"exists":true,"revision":"..."}},"content_path":"/project/.monika/blobs/..."}]}
+```
+
+Coreは要求された観測だけを渡す。取得済みの資源にはそのセッションの固定済み観測を使い、
+未取得の資源は登録した提供元の `observe` で観測する。拡張は返された内容を読み、
+そこから必要になった次の資源を要求できる。`dependencies` 操作やセッション全体の観測一覧は使わない。
+
+不在も `state.exists:false` の観測として渡す。その資源が必要か、次の候補を調べるかは解決拡張が判断する。
+取得や入力検証に失敗した場合は `{"protocol":1,"id":2,"read_error":"理由"}` を返す。
+拡張は解決の `error` 応答を返して処理を終える。観測要求の失敗後に領域を返しても、Coreはその解決を成功扱いにしない。
+
+同じ拡張が提供元も兼ねる場合、観測の応答を待つ間にCoreから別の `id` の `observe` 要求が届く。
+その要求に応答すると、元の `id` の `read_result` が届き、解決を続けられる。
+一つの解決の観測要求は直列で処理し、同じプロセスで別の解決を並行して起動しない。
+
+[Pythonの通信ヘルパー](examples/extension_api.py)は、このやり取りと解決中の再参照のキャッシュを提供する。
+`Extension(handler).run()` で起動し、handler内では次のように観測を読む。
+
+```python
+def handler(operation, data, context):
+    # resolveの処理内。指定の解釈は拡張が担当する。
+    item = context.read(resource_uri)
+    if item["observation"]["state"]["exists"]:
+        content = pathlib.Path(item["content_path"]).read_bytes()
+```
+
+`context.read_many(resource_uris)` で複数の観測をまとめて要求できる。
+実行可能なhandler全体は [試験用拡張](tests/fixtures/sets_extension.py)にある。
+
+解決が完了したら、`result` として領域の意味を返す。
+
+```json
+{"domain":"test.sets.v1","identity":[["observation-id",0]],"content":{"count":1}}
 ```
 
 `domain` は共通の比較規則を使う領域表現を識別する。
 `identity` と `content` は任意のJSONで、Coreは内部の意味を解釈しない。
-`observations` には依存したObservation IDを列挙する。入力にない観測を参照するRegionは拒否する。
+Coreが読み取りを記録し、完成したRegionに `observations` として依存するObservation IDを付ける。
+探索に使った設定や不在の観測も含む。拡張はこのフィールドを返さない。
 任意の `equivalence_key` 文字列を付けると、大量の宣言を集約する際の比較を絞り込める。
 同じdomain内で同一の領域は、キーを付ける場合には同じ値にする。
 異なるキーなら同一ではないと判断でき、同じキーなら実際の比較を行う。
 キーのない領域も比較操作で判定する。拡張テストはキーと同一性の整合も検査する。
 `show` は `content` を表示する。文字列なら本文、それ以外ならJSONとして表示する。
 
-解決ごとに使用した観測集合をsnapshotに記録する。後でsessionに別の資源が加わっても、
-保存したselectorの再解決には当時の入力集合を使う。
+解決ごとに要求した資源をsnapshotの `resolution_reads` に記録する。観測のメタデータと内容は
+セッションに一度保存し、各解決にはその資源の参照だけを残す。後で別の資源が加わっても、
+保存したselectorの再解決では元の依存だけを使う。再実行で依存を増減させる解決はエラーになる。
+未解決のselectorをsnapshotで解決する場合も、そこに保存された資源だけを要求できる。
 
 `compare` のinputは `{"left":Region,"right":Region}`。
 返す値は `"equal"`・`"contains"`・`"within"`・`"incomparable"` のいずれか。

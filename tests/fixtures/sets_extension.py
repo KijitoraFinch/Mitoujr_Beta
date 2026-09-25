@@ -11,6 +11,10 @@ import time
 from urllib.parse import unquote_to_bytes, urlparse
 
 
+sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2] / "examples"))
+from extension_api import Extension
+
+
 NAME = sys.argv[1] if len(sys.argv) > 1 else "sets"
 
 def resource_path(resource):
@@ -51,38 +55,36 @@ def encode(document):
     return (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode()
 
 
-def query_for(selector):
+def query_for(selector, workspace):
     query = selector["query"]
     if isinstance(query, str) or query is None:
         resource = selector["resource"]
         if not urlparse(resource).scheme:
-            resource = (pathlib.Path(WORKSPACE) / resource).resolve().as_uri()
+            resource = (workspace / resource).resolve().as_uri()
         return {"resources": [resource], "minimum": int(query or 0)}
     return query
 
 
-def execute(operation, data):
+def execute(operation, data, context):
+    workspace = context.workspace
     if operation == "describe":
         return {
             "name": NAME,
             "revision": "test-v1",
-            "operations": ["observe", "dependencies", "resolve", "compare", "extract", "check_plan", "check", "edit", "commit"],
+            "operations": ["observe", "resolve", "compare", "extract", "check_plan", "check", "edit", "commit"],
             "domains": ["test.sets.v1"],
             "description": "Select rows from multiple observed JSON resources",
         }
     if operation == "observe":
         content, state = read_resource(data["resource"])
         return {"bytes": list(content), "state": state}
-    if operation == "dependencies":
-        return query_for(data["selector"])["resources"]
     if operation == "resolve":
-        query = query_for(data["selector"])
-        selected, observations = [], []
-        for item in data["observations"]:
+        query = query_for(data["selector"], workspace)
+        selected = []
+        for item in context.read_many(query["resources"]):
             observation = item["observation"]
-            if observation["resource"] not in query["resources"]:
-                continue
-            observations.append(observation["id"])
+            if not observation["state"]["exists"]:
+                raise ValueError("resource does not exist: " + observation["resource"])
             rows = json.loads(pathlib.Path(item["content_path"]).read_bytes())
             selected.extend(
                 [observation["id"], index]
@@ -93,7 +95,6 @@ def execute(operation, data):
             "domain": "test.sets.v1",
             "identity": sorted(selected),
             "equivalence_key": hashlib.sha256(json.dumps(sorted(selected), separators=(",", ":")).encode()).hexdigest(),
-            "observations": sorted(observations),
             "content": {"count": len(selected)},
         }
     if operation == "compare":
@@ -151,7 +152,7 @@ def execute(operation, data):
             _, state = read_resource(data["resource"])
             return {"content_hash": data["replacement"]["content_hash"], "state": state}
         path = resource_path(data["resource"])
-        lock_directory = pathlib.Path(WORKSPACE) / ".monika" / "fixture-locks"
+        lock_directory = workspace / ".monika" / "fixture-locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
         lock_path = lock_directory / hashlib.sha256(data["resource"].encode()).hexdigest()
         with lock_path.open("a") as lock:
@@ -173,7 +174,7 @@ def execute(operation, data):
             os.replace(staged.name, path)
             content, state = read_resource(data["resource"])
             if NAME == "pause_after_commit":
-                marker = pathlib.Path(WORKSPACE) / "commit-completed.json"
+                marker = workspace / "commit-completed.json"
                 commits = json.loads(marker.read_text())["commits"] if marker.exists() else 0
                 staged_marker = marker.with_suffix(".tmp")
                 staged_marker.write_text(json.dumps({"commits": commits + 1, "pid": os.getpid()}))
@@ -199,13 +200,5 @@ def execute(operation, data):
     raise ValueError("unsupported operation: " + operation)
 
 
-for line in sys.stdin:
-    request = json.loads(line)
-    WORKSPACE = request["workspace"]
-    if request["protocol"] != 1:
-        raise ValueError("unsupported protocol")
-    try:
-        response = {"result": execute(request["operation"], request["input"])}
-    except Exception as error:
-        response = {"error": str(error)}
-    print(json.dumps({"protocol": 1, "id": request["id"], **response}), flush=True)
+if __name__ == "__main__":
+    Extension(execute).run()
