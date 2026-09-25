@@ -499,6 +499,93 @@ fn cli_usage_errors_are_json_and_initialization_has_no_implicit_formats() -> Res
     Ok(())
 }
 
+#[cfg(unix)]
+#[test]
+fn sidecar_paths_resolve_symlink_parents_before_editing_or_creating() -> Result<()> {
+    let dir = setup()?;
+    fs::create_dir_all(dir.path().join("real/inner"))?;
+    std::os::unix::fs::symlink("real/inner", dir.path().join("shortcut"))?;
+    let original = declaration("victim", 2, json!({"note": "keep"}));
+    write_links(dir.path(), "victim.links", vec![original.clone()])?;
+    write_links(dir.path(), "real/victim.links", vec![original.clone()])?;
+    let untouched = fs::read(dir.path().join("victim.links"))?;
+
+    let (code, result) = run(
+        dir.path(),
+        &[
+            "link",
+            "remove",
+            "--in",
+            "shortcut/../victim.links",
+            "--extension",
+            "sets",
+            "--id",
+            "victim",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "{result}");
+    assert_eq!(fs::read(dir.path().join("victim.links"))?, untouched);
+    let updated: Value = serde_json::from_slice(&fs::read(dir.path().join("real/victim.links"))?)?;
+    assert_eq!(updated["links"], json!([]));
+
+    let (code, result) = run(
+        dir.path(),
+        &[
+            "link",
+            "add",
+            "--in",
+            "shortcut/../新規 #100%.links",
+            "--extension",
+            "sets",
+            "--declaration",
+            "-",
+        ],
+        Some(&original),
+    )?;
+    assert_eq!(code, 0, "{result}");
+    assert!(!dir.path().join("新規 #100%.links").exists());
+    let created: Value =
+        serde_json::from_slice(&fs::read(dir.path().join("real/新規 #100%.links"))?)?;
+    assert_eq!(created["links"], json!([original]));
+    Ok(())
+}
+
+#[test]
+fn source_scan_preserves_filenames_and_replays_after_directory_deletion() -> Result<()> {
+    let dir = setup()?;
+    let mut config: Value = serde_json::from_slice(&fs::read(dir.path().join("monika.json"))?)?;
+    config["sources"][0]["pattern"] = json!("**/*.links");
+    fs::write(dir.path().join("monika.json"), serde_json::to_vec(&config)?)?;
+    let folder = dir.path().join("資料");
+    fs::create_dir(&folder)?;
+    let path = folder.join("注釈 #100%.links");
+    fs::write(
+        &path,
+        serde_json::to_vec(&json!({"links": [declaration("one", 0, Value::Null)]}))?,
+    )?;
+
+    let (code, result) = run(dir.path(), &["links"], None)?;
+    assert_eq!(code, 0, "{result}");
+    assert_eq!(result["complete"], true);
+    assert_eq!(result["data"]["links"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        result["data"]["links"][0]["occurrences"][0]["evidence"]["resource"],
+        url::Url::from_file_path(path.canonicalize()?)
+            .unwrap()
+            .as_str()
+    );
+    fs::remove_dir_all(&folder)?;
+    let (code, replay) = run(
+        dir.path(),
+        &["--snapshot", result["snapshot"].as_str().unwrap(), "links"],
+        None,
+    )?;
+    assert_eq!(code, 0, "{replay}");
+    assert_eq!(replay["data"]["links"], result["data"]["links"]);
+    Ok(())
+}
+
 #[test]
 fn documented_walkthrough_executes_every_command_with_real_files() -> Result<()> {
     let output = Command::new("python3")
@@ -624,7 +711,7 @@ fn core_rejects_annotation_loss_and_does_not_accept_an_unperformed_write() -> Re
 fn interrupt_stops_a_waiting_cli_and_its_extension() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let config = json!({"version":1,"sources":[],"extensions":{"slow":{
-        "command":["python3","-c","import os,pathlib,time; pathlib.Path('worker.pid').write_text(str(os.getpid())); time.sleep(60)"],
+        "command":["python3","-c","import os,pathlib,time; pid=pathlib.Path('worker.pid.tmp'); pid.write_text(str(os.getpid())); pid.replace('worker.pid'); time.sleep(60)"],
         "revision":"1","timeout_ms":30000
     }}});
     fs::write(dir.path().join("monika.json"), serde_json::to_vec(&config)?)?;

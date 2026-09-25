@@ -114,11 +114,11 @@ impl Expression {
 
     /// False dominates AND and true dominates OR, including when another
     /// operand is unknown. An unresolved predicate never silently becomes false.
-    pub fn evaluate(&self, engine: &mut Engine, link: &Link) -> Result<bool> {
+    pub async fn evaluate(&self, engine: &mut Engine<'_>, link: &Link) -> Result<bool> {
         match self {
-            Self::And { args } => combine(args, engine, link, false),
-            Self::Or { args } => combine(args, engine, link, true),
-            Self::Not { arg } => Ok(!arg.evaluate(engine, link)?),
+            Self::And { args } => combine(args, engine, link, false).await,
+            Self::Or { args } => combine(args, engine, link, true).await,
+            Self::Not { arg } => Ok(!Box::pin(arg.evaluate(engine, link)).await?),
             Self::Exists { field } => Ok(match Field::parse(field)? {
                 Field::Source | Field::Target => true,
                 Field::Id => !link.ids().is_empty(),
@@ -139,13 +139,13 @@ impl Expression {
                     }
                     (field @ (Field::Source | Field::Target), Operand::Region(target)) => {
                         let selector = target.expand(&engine.session.workspace.config.names)?;
-                        let expected = engine.resolve(&selector)?;
+                        let expected = engine.resolve(&selector).await?;
                         let actual = match field {
                             Field::Source => &link.source,
                             _ => &link.target,
                         }
                         .region()?;
-                        let comparison = engine.compare(actual, &expected)?;
+                        let comparison = engine.compare(actual, &expected).await?;
                         Ok(match relation {
                             Predicate::Equal => comparison == Relation::Equal,
                             Predicate::NotEqual => comparison != Relation::Equal,
@@ -183,10 +183,15 @@ fn equality(predicate: Predicate, equal: bool) -> Result<bool> {
     }
 }
 
-fn combine(args: &[Expression], engine: &mut Engine, link: &Link, decisive: bool) -> Result<bool> {
+async fn combine(
+    args: &[Expression],
+    engine: &mut Engine<'_>,
+    link: &Link,
+    decisive: bool,
+) -> Result<bool> {
     let mut errors = Vec::new();
     for arg in args {
-        match arg.evaluate(engine, link) {
+        match Box::pin(arg.evaluate(engine, link)).await {
             Ok(value) if value == decisive => return Ok(decisive),
             Ok(_) => {}
             Err(error) => errors.push(format!("{error:#}")),

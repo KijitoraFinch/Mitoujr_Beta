@@ -15,6 +15,13 @@ serde_json = { version = "1", features = ["arbitrary_precision"] }
 sha2 = "0.10"
 url = "2"
 tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "signal", "io-util", "io-std", "fs", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = "0.3"
+process-wrap = { version = "10", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop"] }
 
 [target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false }
+
+[target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"

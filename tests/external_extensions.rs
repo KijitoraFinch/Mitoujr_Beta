@@ -22,63 +22,71 @@ fn extension() -> ProcessExtension {
     }
 }
 
-fn configure(path: &Path) -> Result<Workspace> {
+async fn configure(path: &Path) -> Result<Workspace> {
     let mut config = Config::default();
     config.extensions.insert("sets".into(), extension());
     fs::write(path.join("monika.json"), serde_json::to_vec(&config)?)?;
-    Workspace::open(path)
+    Workspace::open(path).await
 }
 
-#[test]
-fn real_process_resolves_multiple_observations_and_replays_saved_content() -> Result<()> {
+#[tokio::test]
+async fn real_process_resolves_multiple_observations_and_replays_saved_content() -> Result<()> {
+    let mut host = process::Host::default();
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("a.json"), "[1,2,3]")?;
     fs::write(dir.path().join("b.json"), "[2,4]")?;
-    let workspace = configure(dir.path())?;
-    let a = workspace.resource("a.json")?;
-    let b = workspace.resource("b.json")?;
+    let workspace = configure(dir.path()).await?;
+    let a = workspace.resource("a.json").await?;
+    let b = workspace.resource("b.json").await?;
     let selector = |minimum| Selector {
         extension: "sets".into(),
         resource: None,
         query: json!({"resources": [a, b], "minimum": minimum}),
     };
-    let mut engine = Engine::new(Session::new(workspace)?)?;
-    let all = engine.resolve(&selector(0))?;
-    let part = engine.resolve(&selector(3))?;
+    let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
+    let all = engine.resolve(&selector(0)).await?;
+    let part = engine.resolve(&selector(3)).await?;
     assert_eq!(all.content["count"], 5);
     assert_eq!(part.content["count"], 2);
     assert_eq!(all.observations.len(), 2);
-    assert_eq!(engine.compare(&all, &part)?, Relation::Contains);
-    assert_eq!(engine.compare(&part, &all)?, Relation::Within);
-    let snapshot = engine.session.save()?;
+    assert_eq!(engine.compare(&all, &part).await?, Relation::Contains);
+    assert_eq!(engine.compare(&part, &all).await?, Relation::Within);
+    let snapshot = engine.session.save().await?;
     fs::write(dir.path().join("a.json"), "[100]")?;
     fs::remove_file(dir.path().join("b.json"))?;
-    let mut replay = Engine::new(Session::replay(Workspace::open(dir.path())?, &snapshot)?)?;
-    assert_eq!(replay.resolve(&selector(0))?, all);
-    assert_eq!(replay.resolve(&selector(3))?, part);
-    assert_eq!(replay.compare(&all, &part)?, Relation::Contains);
+    let mut replay = Engine::new(
+        Session::replay(Workspace::open(dir.path()).await?, &snapshot).await?,
+        &mut host,
+    )?;
+    assert_eq!(replay.resolve(&selector(0)).await?, all);
+    assert_eq!(replay.resolve(&selector(3)).await?, part);
+    assert_eq!(replay.compare(&all, &part).await?, Relation::Contains);
+    host.shutdown(false).await?;
     Ok(())
 }
 
-#[test]
-fn process_observation_freezes_external_resource_and_reports_failure() -> Result<()> {
+#[tokio::test]
+async fn process_observation_freezes_external_resource_and_reports_failure() -> Result<()> {
+    let mut host = process::Host::default();
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("external.json"), "[42]")?;
-    let workspace = configure(dir.path())?;
+    let workspace = configure(dir.path()).await?;
     let resource = workspace
-        .resource("external.json")?
+        .resource("external.json")
+        .await?
         .replacen("file:", "fixture:", 1);
-    let mut engine = Engine::new(Session::new(workspace)?)?;
-    let observed = engine.observe(&resource)?;
+    let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
+    let observed = engine.observe(&resource).await?;
     fs::write(dir.path().join("external.json"), "[24]")?;
-    assert_eq!(engine.session.bytes(&observed)?, b"[42]");
-    assert_eq!(engine.observe(&resource)?, observed);
+    assert_eq!(engine.session.bytes(&observed).await?, b"[42]");
+    assert_eq!(engine.observe(&resource).await?, observed);
     let missing = engine
         .session
         .workspace
-        .resource("missing.json")?
+        .resource("missing.json")
+        .await?
         .replacen("file:", "fixture:", 1);
-    assert!(!engine.observe(&missing)?.state.exists);
+    assert!(!engine.observe(&missing).await?.state.exists);
     assert!(
         engine
             .resolve(&Selector {
@@ -86,9 +94,10 @@ fn process_observation_freezes_external_resource_and_reports_failure() -> Result
                 resource: None,
                 query: json!({"resources":[missing]})
             })
+            .await
             .is_err()
     );
-    assert!(engine.observe("unsupported:resource").is_err());
+    assert!(engine.observe("unsupported:resource").await.is_err());
     assert!(
         engine
             .session
@@ -96,21 +105,29 @@ fn process_observation_freezes_external_resource_and_reports_failure() -> Result
             .failures
             .contains_key("unsupported:resource")
     );
+    host.shutdown(false).await?;
     Ok(())
 }
 
-#[test]
-fn extension_protocol_rejects_wrong_revision_and_reports_errors_and_timeout() -> Result<()> {
+#[tokio::test]
+async fn extension_protocol_rejects_wrong_revision_and_reports_errors_and_timeout() -> Result<()> {
+    let mut host = process::Host::default();
     let dir = tempfile::tempdir()?;
     let mut config = extension();
     config.revision = "wrong".into();
     assert!(
-        process::describe(dir.path(), "sets", &config)
+        host.worker(dir.path(), "sets", &config)?
+            .describe("sets", &config.revision)
+            .await
             .unwrap_err()
             .to_string()
             .contains("revision mismatch")
     );
-    let error = process::invoke(dir.path(), &extension(), "unknown", Value::Null).unwrap_err();
+    let error = host
+        .worker(dir.path(), "sets", &extension())?
+        .invoke("unknown", Value::Null)
+        .await
+        .unwrap_err();
     assert!(
         error.to_string().contains("unsupported operation"),
         "{error:#}"
@@ -126,18 +143,22 @@ fn extension_protocol_rejects_wrong_revision_and_reports_errors_and_timeout() ->
         timeout_ms: 30,
     };
     assert!(
-        process::invoke(dir.path(), &config, "describe", Value::Null)
+        host.worker(dir.path(), "slow", &config)?
+            .invoke("describe", Value::Null)
+            .await
             .unwrap_err()
             .to_string()
             .contains("timed out")
     );
+    host.shutdown(false).await?;
     Ok(())
 }
 
-#[test]
-fn snapshot_reuses_source_inventory_instead_of_scanning_live_files() -> Result<()> {
+#[tokio::test]
+async fn snapshot_reuses_source_inventory_instead_of_scanning_live_files() -> Result<()> {
+    let mut host = process::Host::default();
     let dir = tempfile::tempdir()?;
-    let mut workspace = configure(dir.path())?;
+    let mut workspace = configure(dir.path()).await?;
     workspace.config.sources.push(Source {
         pattern: "*.links".into(),
         extension: "sets".into(),
@@ -155,58 +176,68 @@ fn snapshot_reuses_source_inventory_instead_of_scanning_live_files() -> Result<(
         dir.path().join("original.links"),
         serde_json::to_vec(&document)?,
     )?;
-    let mut engine = Engine::new(Session::new(workspace)?)?;
-    let original = engine.extract()?;
+    let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
+    let original = engine.extract().await?;
     assert!(
         original.diagnostics.is_empty(),
         "{:?}",
         original.diagnostics
     );
     assert_eq!(original.occurrences.len(), 1);
-    let snapshot = engine.session.save()?;
+    let snapshot = engine.session.save().await?;
     fs::remove_file(dir.path().join("original.links"))?;
     fs::write(
         dir.path().join("added.links"),
         serde_json::to_vec(&document)?,
     )?;
-    let mut replay = Engine::new(Session::replay(Workspace::open(dir.path())?, &snapshot)?)?;
-    assert_eq!(replay.extract()?.occurrences, original.occurrences);
+    let mut replay = Engine::new(
+        Session::replay(Workspace::open(dir.path()).await?, &snapshot).await?,
+        &mut host,
+    )?;
+    assert_eq!(replay.extract().await?.occurrences, original.occurrences);
+    host.shutdown(false).await?;
     Ok(())
 }
 
-#[test]
-fn empty_configuration_has_no_builtin_extensions_or_observation_provider() -> Result<()> {
+#[tokio::test]
+async fn empty_configuration_has_no_builtin_extensions_or_observation_provider() -> Result<()> {
+    let mut host = process::Host::default();
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("sample.md"), "[link](somewhere)\n")?;
-    let mut engine = Engine::new(Session::new(Workspace::open(dir.path())?)?)?;
-    assert!(engine.manifests()?.is_empty());
-    assert!(engine.sources()?.is_empty());
-    assert!(engine.extract()?.occurrences.is_empty());
+    let mut engine = Engine::new(Session::new(Workspace::open(dir.path()).await?)?, &mut host)?;
+    assert!(engine.manifests().await?.is_empty());
+    assert!(engine.sources().await?.is_empty());
+    assert!(engine.extract().await?.occurrences.is_empty());
     for name in ["file", "text", "md", "sidecar", "rust", "ts", "python"] {
         assert!(
             engine
                 .resolve(&Selector::parse(&format!("{name}:sample.md"))?)
+                .await
                 .is_err()
         );
     }
     assert!(
         engine
             .observe("sample.md")
+            .await
             .unwrap_err()
             .to_string()
             .contains("no resource provider")
     );
+    host.shutdown(false).await?;
     Ok(())
 }
 
-#[test]
-fn external_regions_obey_comparison_laws_including_empty_and_multi_resource_sets() -> Result<()> {
+#[tokio::test]
+async fn external_regions_obey_comparison_laws_including_empty_and_multi_resource_sets()
+-> Result<()> {
+    let mut host = process::Host::default();
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("rows.json"), "[1,2,3,4]")?;
     fs::write(dir.path().join("more.json"), "[2,5]")?;
-    let workspace = configure(dir.path())?;
-    let resource = workspace.resource("rows.json")?;
-    let other = workspace.resource("more.json")?;
+    let workspace = configure(dir.path()).await?;
+    let resource = workspace.resource("rows.json").await?;
+    let other = workspace.resource("more.json").await?;
     let mut selectors: Vec<_> = [0, 2, 3, 6]
         .into_iter()
         .map(|minimum| Selector {
@@ -230,19 +261,21 @@ fn external_regions_obey_comparison_laws_including_empty_and_multi_resource_sets
         resource: None,
         query: json!({"resources":[resource],"minimum":6}),
     });
-    let mut engine = Engine::new(Session::new(workspace)?)?;
-    let report = monika::extension_test::test_regions(&mut engine, &selectors)?;
+    let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
+    let report = monika::extension_test::test_regions(&mut engine, &selectors).await?;
     assert!(report.passed, "{:?}", report.failures);
     assert_eq!(report.comparison_calls, 98);
+    host.shutdown(false).await?;
     Ok(())
 }
 
-#[test]
-fn separate_extensions_share_a_comparison_domain_via_explicit_provider() -> Result<()> {
+#[tokio::test]
+async fn separate_extensions_share_a_comparison_domain_via_explicit_provider() -> Result<()> {
+    let mut host = process::Host::default();
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("rows.json"), "[1,2,3]")?;
-    let mut workspace = configure(dir.path())?;
-    let resource = workspace.resource("rows.json")?;
+    let mut workspace = configure(dir.path()).await?;
+    let resource = workspace.resource("rows.json").await?;
     let mut second = extension();
     second.command.push("second".into());
     second.schemes.clear();
@@ -251,30 +284,33 @@ fn separate_extensions_share_a_comparison_domain_via_explicit_provider() -> Resu
         .config
         .comparators
         .insert("test.sets.v1".into(), "sets".into());
-    let mut engine = Engine::new(Session::new(workspace)?)?;
+    let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
     let make_selector = |extension: &str, minimum| Selector {
         extension: extension.into(),
         resource: None,
         query: json!({"resources": [resource], "minimum": minimum}),
     };
-    let left = engine.resolve(&make_selector("sets", 0))?;
-    let alias = engine.resolve(&make_selector("second", 0))?;
-    let part = engine.resolve(&make_selector("second", 3))?;
-    assert_eq!(engine.compare(&left, &alias)?, Relation::Equal);
-    assert_eq!(engine.compare(&left, &part)?, Relation::Contains);
+    let left = engine.resolve(&make_selector("sets", 0)).await?;
+    let alias = engine.resolve(&make_selector("second", 0)).await?;
+    let part = engine.resolve(&make_selector("second", 3)).await?;
+    assert_eq!(engine.compare(&left, &alias).await?, Relation::Equal);
+    assert_eq!(engine.compare(&left, &part).await?, Relation::Contains);
     engine.session.workspace.config.comparators.clear();
     assert!(
         engine
             .compare(&left, &alias)
+            .await
             .unwrap_err()
             .to_string()
             .contains("multiple comparison providers")
     );
+    host.shutdown(false).await?;
     Ok(())
 }
 
-#[test]
-fn worker_reuses_one_process_and_poisoned_protocol_does_not_restart() -> Result<()> {
+#[tokio::test]
+async fn worker_reuses_one_process_and_poisoned_protocol_does_not_restart() -> Result<()> {
+    let mut host = process::Host::default();
     let dir = tempfile::tempdir()?;
     let script = "import os,json,sys\nfor line in sys.stdin:\n r=json.loads(line); print(json.dumps({'protocol':1,'id':r['id'],'result':os.getpid()}),flush=True)";
     let config = ProcessExtension {
@@ -283,16 +319,17 @@ fn worker_reuses_one_process_and_poisoned_protocol_does_not_restart() -> Result<
         schemes: vec![],
         timeout_ms: 1000,
     };
-    let mut worker = process::Worker::spawn(dir.path(), &config)?;
-    let first = worker.invoke("ping", Value::Null)?;
+    let worker = host.worker(dir.path(), "worker", &config)?;
+    let first = worker.invoke("ping", Value::Null).await?;
     for _ in 0..20 {
-        assert_eq!(worker.invoke("ping", Value::Null)?, first);
+        assert_eq!(worker.invoke("ping", Value::Null).await?, first);
     }
     let bad = ProcessExtension { command: vec!["python3".into(), "-c".into(), "import sys; sys.stdin.readline(); print('{\"protocol\":1,\"id\":999,\"result\":null}',flush=True); sys.stdin.read()".into()], ..config };
-    let mut worker = process::Worker::spawn(dir.path(), &bad)?;
+    let worker = host.worker(dir.path(), "bad", &bad)?;
     assert!(
         worker
             .invoke("ping", Value::Null)
+            .await
             .unwrap_err()
             .to_string()
             .contains("ID mismatch")
@@ -300,15 +337,18 @@ fn worker_reuses_one_process_and_poisoned_protocol_does_not_restart() -> Result<
     assert!(
         worker
             .invoke("ping", Value::Null)
+            .await
             .unwrap_err()
             .to_string()
             .contains("unavailable")
     );
+    host.shutdown(false).await?;
     Ok(())
 }
 
-#[test]
-fn worker_timeout_covers_a_blocked_stdin_write() -> Result<()> {
+#[tokio::test]
+async fn worker_timeout_covers_a_blocked_stdin_write() -> Result<()> {
+    let mut host = process::Host::default();
     let dir = tempfile::tempdir()?;
     let config = ProcessExtension {
         command: vec![
@@ -320,12 +360,14 @@ fn worker_timeout_covers_a_blocked_stdin_write() -> Result<()> {
         schemes: vec![],
         timeout_ms: 50,
     };
-    let mut worker = process::Worker::spawn(dir.path(), &config)?;
+    let worker = host.worker(dir.path(), "worker", &config)?;
     let started = std::time::Instant::now();
     let error = worker
         .invoke("blocked", json!("x".repeat(1_000_000)))
+        .await
         .unwrap_err();
     assert!(error.to_string().contains("timed out"), "{error:#}");
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    host.shutdown(false).await?;
     Ok(())
 }

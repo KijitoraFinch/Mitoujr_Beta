@@ -95,8 +95,8 @@ impl Patch {
     }
 }
 
-fn extract(
-    engine: &mut Engine,
+async fn extract(
+    engine: &mut Engine<'_>,
     destination: &Destination,
     observation: &Observation,
 ) -> Result<Vec<Occurrence>> {
@@ -104,8 +104,11 @@ fn extract(
         return Ok(Vec::new());
     }
     let input = json!({"observation": observation, "content_path": engine.session.workspace.blob_path(observation)?});
-    let extracted: Extraction =
-        serde_json::from_value(engine.call(&destination.extension, "extract", input)?)?;
+    let extracted: Extraction = serde_json::from_value(
+        engine
+            .call(&destination.extension, "extract", input)
+            .await?,
+    )?;
     ensure!(
         extracted.diagnostics.is_empty(),
         "cannot edit incompletely interpreted declarations: {}",
@@ -146,14 +149,18 @@ fn pick<'a>(occurrences: &'a [Occurrence], pick: &Pick) -> Result<&'a Occurrence
     Ok(matches[0])
 }
 
-pub fn prepare(engine: &mut Engine, destination: &Destination, change: &Change) -> Result<Patch> {
-    let before = engine.observe(&destination.resource)?;
+pub async fn prepare(
+    engine: &mut Engine<'_>,
+    destination: &Destination,
+    change: &Change,
+) -> Result<Patch> {
+    let before = engine.observe(&destination.resource).await?;
     ensure!(
-        engine.manifest(&before.provider)?.supports("commit"),
+        engine.manifest(&before.provider).await?.supports("commit"),
         "resource provider {} cannot commit patches",
         before.provider
     );
-    let occurrences = extract(engine, destination, &before)?;
+    let occurrences = extract(engine, destination, &before).await?;
     let (request, expected, removed) = match change {
         Change::Add { declaration } => (
             json!({"op":"add", "declaration": declaration}),
@@ -191,8 +198,8 @@ pub fn prepare(engine: &mut Engine, destination: &Destination, change: &Change) 
             from,
             pick: selection,
         } => {
-            let source = engine.observe(&from.resource)?;
-            let extracted = extract(engine, from, &source)?;
+            let source = engine.observe(&from.resource).await?;
+            let extracted = extract(engine, from, &source).await?;
             let declaration = pick(&extracted, selection)?.declaration.clone();
             (
                 json!({"op":"add", "declaration": declaration}),
@@ -212,7 +219,7 @@ pub fn prepare(engine: &mut Engine, destination: &Destination, change: &Change) 
     }
     let result: EditResult = serde_json::from_value(engine.call(&destination.extension, "edit", json!({
         "observation": before, "content_path": engine.session.workspace.blob_path(&before)?, "change": request,
-    }))?).context("invalid edit result")?;
+    })).await?).context("invalid edit result")?;
     let proposed = Observation::new(
         before.resource.clone(),
         &result.bytes,
@@ -226,8 +233,9 @@ pub fn prepare(engine: &mut Engine, destination: &Destination, change: &Change) 
     engine
         .session
         .workspace
-        .save_observation(&proposed, &result.bytes)?;
-    let after = extract(engine, destination, &proposed)?;
+        .save_observation(&proposed, &result.bytes)
+        .await?;
+    let after = extract(engine, destination, &proposed).await?;
     if let Some(expected) = expected {
         let location = result
             .location
@@ -278,7 +286,7 @@ pub fn prepare(engine: &mut Engine, destination: &Destination, change: &Change) 
     Ok(patch)
 }
 
-pub fn apply(engine: &mut Engine, patch: &Patch) -> Result<Value> {
+pub async fn apply(engine: &mut Engine<'_>, patch: &Patch) -> Result<Value> {
     patch.validate()?;
     ensure!(
         !engine.session.frozen,
@@ -299,11 +307,15 @@ pub fn apply(engine: &mut Engine, patch: &Patch) -> Result<Value> {
         digest(&serde_json::to_vec(config)?) == patch.provider_config_hash,
         "resource provider configuration changed since the patch was prepared"
     );
-    engine.session.workspace.read_observation(&patch.before)?;
+    engine
+        .session
+        .workspace
+        .read_observation(&patch.before)
+        .await?;
     // A separate session deliberately bypasses observations cached while preparing
     // the patch. The provider must also perform conditional commit atomically.
-    let mut current = Engine::new(Session::new(engine.session.workspace.clone())?)?;
-    let observed = current.observe(&patch.before.resource)?;
+    let mut current = Engine::new(Session::new(engine.session.workspace.clone())?, engine.host)?;
+    let observed = current.observe(&patch.before.resource).await?;
     ensure!(
         observed.provider == patch.before.provider
             && observed.content_hash == patch.before.content_hash
@@ -320,7 +332,7 @@ pub fn apply(engine: &mut Engine, patch: &Patch) -> Result<Value> {
             "replacement": {"content_hash": patch.after_hash, "bytes": patch.replacement.bytes()},
             "patch_id": patch.id,
         }),
-    )?;
+    ).await?;
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Committed {
@@ -335,13 +347,13 @@ pub fn apply(engine: &mut Engine, patch: &Patch) -> Result<Value> {
     );
     // Read back the resource through its provider, independently of the commit
     // response. Never turn an unconfirmed write into a successful patch result.
-    let mut after = Engine::new(Session::new(engine.session.workspace.clone())?)?;
-    let observation = after.observe(&patch.before.resource)?;
+    let mut after = Engine::new(Session::new(engine.session.workspace.clone())?, engine.host)?;
+    let observation = after.observe(&patch.before.resource).await?;
     ensure!(
         observation.content_hash == patch.after_hash && observation.state == committed.state,
         "resource does not match the committed patch; inspect resource state before retrying"
     );
     Ok(
-        json!({"patch": patch.id, "resource": patch.before.resource, "observation": observation, "snapshot": after.session.save()?}),
+        json!({"patch": patch.id, "resource": patch.before.resource, "observation": observation, "snapshot": after.session.save().await?}),
     )
 }

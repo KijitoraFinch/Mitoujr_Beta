@@ -33,8 +33,8 @@ impl Endpoint {
         }
     }
 
-    pub fn resolve(engine: &mut Engine, selector: Selector) -> Self {
-        match engine.resolve(&selector) {
+    pub async fn resolve(engine: &mut Engine<'_>, selector: Selector) -> Self {
+        match engine.resolve(&selector).await {
             Ok(region) => Self::Resolved { selector, region },
             Err(error) => Self::Unresolved {
                 selector: Some(selector),
@@ -141,7 +141,7 @@ pub struct Graph {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-fn same_endpoint(engine: &mut Engine, left: &Endpoint, right: &Endpoint) -> Result<bool> {
+async fn same_endpoint(engine: &mut Engine<'_>, left: &Endpoint, right: &Endpoint) -> Result<bool> {
     if let (Some(left), Some(right)) = (left.selector(), right.selector())
         && left == right
     {
@@ -157,14 +157,14 @@ fn same_endpoint(engine: &mut Engine, left: &Endpoint, right: &Endpoint) -> Resu
             {
                 return Ok(false);
             }
-            Ok(engine.compare(left, right)? == Relation::Equal)
+            Ok(engine.compare(left, right).await? == Relation::Equal)
         }
         _ => Ok(false),
     }
 }
 
-pub fn build(engine: &mut Engine) -> Result<Graph> {
-    let extracted = engine.extract()?;
+pub async fn build(engine: &mut Engine<'_>) -> Result<Graph> {
+    let extracted = engine.extract().await?;
     let mut graph = Graph {
         links: Vec::new(),
         conflicts: Vec::new(),
@@ -172,15 +172,15 @@ pub fn build(engine: &mut Engine) -> Result<Graph> {
         diagnostics: extracted.diagnostics,
     };
     for occurrence in extracted.occurrences {
-        crate::cancellation::check()?;
-        let source = Endpoint::resolve(engine, occurrence.declaration.source.clone());
+        tokio::task::yield_now().await;
+        let source = Endpoint::resolve(engine, occurrence.declaration.source.clone()).await;
         let target = match occurrence
             .declaration
             .reference
             .target
             .expand(&engine.session.workspace.config.names)
         {
-            Ok(selector) => Endpoint::resolve(engine, selector),
+            Ok(selector) => Endpoint::resolve(engine, selector).await,
             Err(error) => Endpoint::Unresolved {
                 selector: None,
                 error: format!("{error:#}"),
@@ -191,8 +191,8 @@ pub fn build(engine: &mut Engine) -> Result<Graph> {
             if candidate.declaration().annotation != occurrence.declaration.annotation {
                 continue;
             }
-            let same = (|| -> Result<bool> {
-                if !same_endpoint(engine, &source, &candidate.source)? {
+            let same = (async {
+                if !same_endpoint(engine, &source, &candidate.source).await? {
                     return Ok(false);
                 }
                 if target.selector().is_none() && candidate.target.selector().is_none() {
@@ -200,8 +200,9 @@ pub fn build(engine: &mut Engine) -> Result<Graph> {
                         occurrence.declaration.reference == candidate.declaration().reference
                     );
                 }
-                same_endpoint(engine, &target, &candidate.target)
-            })();
+                same_endpoint(engine, &target, &candidate.target).await
+            })
+            .await;
             match same {
                 Ok(true) => {
                     matched = Some(index);

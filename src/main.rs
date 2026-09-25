@@ -1,13 +1,16 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
+use monika::cancellation::{Interrupt, Signals};
 use monika::editing::{Change, Destination, Pick};
+use monika::extensions::process::Host;
 use monika::operations::{self, Operation, Response};
 use monika::query::{self, Expression, Operand, Predicate};
 use monika::workspace::Workspace;
 use serde_json::Value;
-use std::io::{self, Read, Write};
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Parser)]
 #[command(
@@ -154,12 +157,12 @@ impl PickArgs {
     }
 }
 
-fn edit_operation(command: LinkCommand) -> Result<Operation> {
+async fn edit_operation(command: LinkCommand) -> Result<Operation> {
     let (edit, change) = match command {
         LinkCommand::Add { edit, declaration } => (
             edit,
             Change::Add {
-                declaration: serde_json::from_value(read_json(Some(&declaration))?)?,
+                declaration: serde_json::from_value(read_json(Some(&declaration)).await?)?,
             },
         ),
         LinkCommand::Set {
@@ -170,7 +173,7 @@ fn edit_operation(command: LinkCommand) -> Result<Operation> {
             edit,
             Change::Set {
                 pick: pick.value()?,
-                declaration: serde_json::from_value(read_json(Some(&declaration))?)?,
+                declaration: serde_json::from_value(read_json(Some(&declaration)).await?)?,
             },
         ),
         LinkCommand::Remove { edit, pick } => (
@@ -205,14 +208,14 @@ fn edit_operation(command: LinkCommand) -> Result<Operation> {
     })
 }
 
-fn read_json(path: Option<&PathBuf>) -> Result<Value> {
+async fn read_json(path: Option<&PathBuf>) -> Result<Value> {
     let bytes = match path {
-        Some(path) if path.as_os_str() != "-" => {
-            std::fs::read(path).with_context(|| format!("read {}", path.display()))?
-        }
+        Some(path) if path.as_os_str() != "-" => tokio::fs::read(path)
+            .await
+            .with_context(|| format!("read {}", path.display()))?,
         _ => {
             let mut bytes = Vec::new();
-            io::stdin().read_to_end(&mut bytes)?;
+            tokio::io::stdin().read_to_end(&mut bytes).await?;
             bytes
         }
     };
@@ -248,7 +251,7 @@ fn filter(args: FilterArgs) -> Result<Option<Expression>> {
     })
 }
 
-fn operation(command: Command) -> Result<Operation> {
+async fn operation(command: Command) -> Result<Operation> {
     Ok(match command {
         Command::Init => Operation::Init,
         Command::Show { target } => Operation::Show {
@@ -260,26 +263,26 @@ fn operation(command: Command) -> Result<Operation> {
         Command::Check(args) => Operation::Check {
             filter: filter(args)?,
         },
-        Command::Link { command } => edit_operation(command)?,
+        Command::Link { command } => edit_operation(command).await?,
         Command::Apply { patch } => Operation::Apply {
-            patch: serde_json::from_value(read_json(Some(&patch))?)?,
+            patch: serde_json::from_value(read_json(Some(&patch)).await?)?,
         },
         Command::Extension { command } => match command {
             ExtensionCommand::List => Operation::ExtensionList,
             ExtensionCommand::Show { name } => Operation::ExtensionShow { name },
             ExtensionCommand::Test { cases } => Operation::ExtensionTest {
-                selectors: serde_json::from_value(read_json(Some(&cases))?)?,
+                selectors: serde_json::from_value(read_json(Some(&cases)).await?)?,
             },
         },
         Command::Request { file } => {
-            serde_json::from_value(read_json(file.as_ref())?).context("invalid operation")?
+            serde_json::from_value(read_json(file.as_ref()).await?).context("invalid operation")?
         }
     })
 }
 
-fn print_human(response: &Response) -> Result<()> {
-    let mut stdout = io::stdout().lock();
-    let mut stderr = io::stderr().lock();
+fn render_human(response: &Response) -> Result<(Vec<u8>, Vec<u8>)> {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
     if let Some(error) = &response.error {
         writeln!(stderr, "error: {error}")?;
     }
@@ -402,15 +405,37 @@ fn print_human(response: &Response) -> Result<()> {
     if let Some(snapshot) = &response.snapshot {
         writeln!(stderr, "snapshot: {snapshot}")?;
     }
+    Ok((stdout, stderr))
+}
+
+async fn emit(response: &Response, json: bool) -> Result<()> {
+    let (stdout, stderr) = if json {
+        let mut bytes = serde_json::to_vec(response)?;
+        bytes.push(b'\n');
+        (bytes, Vec::new())
+    } else {
+        render_human(response)?
+    };
+    let mut output = tokio::io::stdout();
+    output.write_all(&stdout).await?;
+    output.flush().await?;
+    let mut errors = tokio::io::stderr();
+    errors.write_all(&stderr).await?;
+    errors.flush().await?;
     Ok(())
 }
 
-fn main() -> ExitCode {
-    #[cfg(unix)]
-    if let Err(error) = monika::cancellation::install() {
-        eprintln!("{error:#}");
-        return ExitCode::from(2);
-    }
+fn interrupted(signal: Interrupt, snapshot: Option<String>) -> Response {
+    let mut response = Response::error(
+        "operation interrupted; inspect any resource being written before retrying",
+    );
+    response.snapshot = snapshot;
+    response.exit_code = signal.exit_code();
+    response
+}
+
+async fn run() -> Result<u8> {
+    let mut signals = Signals::new()?;
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
@@ -421,55 +446,88 @@ fn main() -> ExitCode {
                     clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
                 )
             {
-                println!(
-                    "{}",
-                    serde_json::to_string(&Response::error(error)).expect("serializable CLI error")
-                );
-                return ExitCode::from(2);
+                emit(&Response::error(error), true).await?;
+                return Ok(2);
             }
             error.exit();
         }
     };
     let json = cli.json || matches!(cli.command, Command::Request { .. });
-    let prepared = (|| -> Result<Response> {
-        let operation = operation(cli.command)?;
-        let root = match cli.root {
-            Some(root) => root,
-            None => Workspace::discover_root(&std::env::current_dir()?)?,
-        };
-        let workspace = if cli.snapshot.is_some() {
-            Workspace::for_replay(&root)?
-        } else {
-            Workspace::open(&root)?
-        };
-        Ok(operations::execute(
-            workspace,
-            cli.snapshot.as_deref(),
-            operation,
-        ))
-    })();
-    let mut response = prepared.unwrap_or_else(|error| Response::error(format!("{error:#}")));
-    if let Some(code) = monika::cancellation::exit_code() {
-        let snapshot = response.snapshot;
-        response = Response::error(
-            "operation interrupted; inspect any resource being written before retrying",
-        );
-        response.snapshot = snapshot;
-        response.exit_code = code;
-    }
-    let printed = if json {
-        (|| -> Result<()> {
-            let mut out = io::stdout().lock();
-            serde_json::to_writer(&mut out, &response)?;
-            writeln!(out)?;
-            Ok(())
-        })()
-    } else {
-        print_human(&response)
+    let mut host = Host::default();
+    let mut interruption = None;
+    let mut response = tokio::select! {
+        biased;
+        signal = signals.recv() => {
+            let signal = signal?;
+            interruption = Some(signal);
+            interrupted(signal, None)
+        }
+        result = async {
+            let operation = operation(cli.command).await?;
+            let root = match cli.root {
+                Some(root) => root,
+                None => Workspace::discover_root(&std::env::current_dir()?).await?,
+            };
+            let workspace = if cli.snapshot.is_some() {
+                Workspace::for_replay(&root).await?
+            } else {
+                Workspace::open(&root).await?
+            };
+            Ok::<_, anyhow::Error>(operations::execute(workspace, cli.snapshot.as_deref(), operation, &mut host).await)
+        } => result.unwrap_or_else(|error| Response::error(format!("{error:#}"))),
     };
-    if let Err(error) = printed {
-        eprintln!("error writing output: {error:#}");
-        return ExitCode::from(2);
+
+    // The host survives cancellation of the operation and owns all subprocesses.
+    let cleanup = loop {
+        tokio::select! {
+            biased;
+            signal = signals.recv() => {
+                let signal = signal?;
+                if interruption.is_some() {
+                    host.terminate()?;
+                    return Ok(signal.exit_code());
+                }
+                interruption = Some(signal);
+            }
+            result = host.shutdown(interruption.is_some()) => break result,
+        }
+    };
+    if let Some(signal) = interruption {
+        response = interrupted(signal, response.snapshot);
     }
-    ExitCode::from(response.exit_code)
+    if let Err(error) = cleanup {
+        response.ok = false;
+        response.complete = false;
+        response.error = Some(match response.error {
+            Some(previous) => format!("{previous}; {error:#}"),
+            None => format!("{error:#}"),
+        });
+        if interruption.is_none() {
+            response.exit_code = 2;
+        }
+    }
+    tokio::select! {
+        biased;
+        signal = signals.recv() => Ok(signal?.exit_code()),
+        result = emit(&response, json) => { result?; Ok(response.exit_code) }
+    }
+}
+
+fn main() -> ExitCode {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("create Tokio runtime");
+    let result = runtime.block_on(run());
+    // Tokio's standard-input reader is a blocking task that cannot be cancelled.
+    // All extensions have been shut down explicitly before reaching this point.
+    // Do not wait for stdin EOF again while exiting this one-shot CLI.
+    runtime.shutdown_background();
+    match result {
+        Ok(code) => ExitCode::from(code),
+        Err(error) => {
+            eprintln!("{error:#}");
+            ExitCode::from(2)
+        }
+    }
 }

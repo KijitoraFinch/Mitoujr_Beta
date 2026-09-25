@@ -1,40 +1,76 @@
-use anyhow::{Result, ensure};
-use std::sync::atomic::{AtomicI32, Ordering};
+use anyhow::{Context, Result};
 
-static SIGNAL: AtomicI32 = AtomicI32::new(0);
-
-#[cfg(unix)]
-extern "C" fn interrupted(signal: libc::c_int) {
-    SIGNAL.store(signal, Ordering::Relaxed);
+#[derive(Clone, Copy, Debug)]
+pub enum Interrupt {
+    Interrupt,
+    Terminate,
 }
 
-#[cfg(unix)]
-pub fn install() -> Result<()> {
-    for signal in [libc::SIGINT, libc::SIGTERM] {
-        // SAFETY: the handler only stores a lock-free atomic and never touches
-        // allocator, locks, or I/O. This is installed before worker threads start.
-        let previous =
-            unsafe { libc::signal(signal, interrupted as *const () as libc::sighandler_t) };
-        ensure!(
-            previous != libc::SIG_ERR,
-            "install signal handler: {}",
-            std::io::Error::last_os_error()
-        );
+impl Interrupt {
+    pub fn exit_code(self) -> u8 {
+        match self {
+            Self::Interrupt => 130,
+            Self::Terminate => 143,
+        }
     }
-    Ok(())
 }
 
-pub fn check() -> Result<()> {
-    let signal = SIGNAL.load(Ordering::Relaxed);
-    ensure!(signal == 0, "operation interrupted by signal {signal}");
-    Ok(())
+/// Signal subscriptions belong to the CLI, not to a process-global polling flag.
+#[cfg(unix)]
+pub struct Signals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
 }
 
-pub fn exit_code() -> Option<u8> {
-    let signal = SIGNAL.load(Ordering::Relaxed);
-    if signal == 0 {
-        None
-    } else {
-        Some(128 + signal as u8)
+#[cfg(unix)]
+impl Signals {
+    pub fn new() -> Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    pub async fn recv(&mut self) -> Result<Interrupt> {
+        tokio::select! {
+            signal = self.interrupt.recv() => {
+                signal.context("interrupt signal stream closed")?;
+                Ok(Interrupt::Interrupt)
+            }
+            signal = self.terminate.recv() => {
+                signal.context("termination signal stream closed")?;
+                Ok(Interrupt::Terminate)
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub struct Signals {
+    interrupt: tokio::signal::windows::CtrlC,
+    terminate: tokio::signal::windows::CtrlBreak,
+}
+
+#[cfg(windows)]
+impl Signals {
+    pub fn new() -> Result<Self> {
+        Ok(Self {
+            interrupt: tokio::signal::windows::ctrl_c()?,
+            terminate: tokio::signal::windows::ctrl_break()?,
+        })
+    }
+
+    pub async fn recv(&mut self) -> Result<Interrupt> {
+        tokio::select! {
+            signal = self.interrupt.recv() => {
+                signal.context("interrupt signal stream closed")?;
+                Ok(Interrupt::Interrupt)
+            }
+            signal = self.terminate.recv() => {
+                signal.context("termination signal stream closed")?;
+                Ok(Interrupt::Terminate)
+            }
+        }
     }
 }

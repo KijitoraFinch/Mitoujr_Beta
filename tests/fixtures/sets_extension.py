@@ -7,22 +7,35 @@ import tempfile
 import json
 import pathlib
 import sys
-from urllib.parse import unquote, urlparse
+import time
+from urllib.parse import unquote_to_bytes, urlparse
 
 
 NAME = sys.argv[1] if len(sys.argv) > 1 else "sets"
 
+def resource_path(resource):
+    parsed = urlparse(resource)
+    if parsed.scheme not in ("file", "fixture") or parsed.netloc not in ("", "localhost"):
+        raise ValueError("expected a local file or fixture URI")
+    if parsed.query or parsed.fragment:
+        raise ValueError("resource URI cannot contain a query or fragment")
+    path = pathlib.Path(os.fsdecode(unquote_to_bytes(parsed.path)))
+    if not path.is_absolute():
+        raise ValueError("resource URI must contain an absolute path")
+    return path
+
+
 def read_resource(resource):
-    path = pathlib.Path(unquote(urlparse(resource).path))
+    path = resource_path(resource)
     try:
         content = path.read_bytes()
         stat = path.stat()
     except FileNotFoundError:
-        return b"", {"exists": False, "revision": {"parent": str(path.parent.resolve())}}
+        return b"", {"exists": False, "revision": {"parent": os.fsencode(path.parent.resolve()).hex()}}
     return content, {"exists": True, "revision": {
         "hash": hashlib.sha256(content).hexdigest(), "device": stat.st_dev,
         "inode": stat.st_ino, "mtime": stat.st_mtime_ns,
-        "path": str(path.resolve()),
+        "path": os.fsencode(path.resolve()).hex(),
     }}
 
 
@@ -137,7 +150,7 @@ def execute(operation, data):
         if NAME == "no_write":
             _, state = read_resource(data["resource"])
             return {"content_hash": data["replacement"]["content_hash"], "state": state}
-        path = pathlib.Path(unquote(urlparse(data["resource"]).path))
+        path = resource_path(data["resource"])
         lock_directory = pathlib.Path(WORKSPACE) / ".monika" / "fixture-locks"
         lock_directory.mkdir(parents=True, exist_ok=True)
         lock_path = lock_directory / hashlib.sha256(data["resource"].encode()).hexdigest()
@@ -159,6 +172,13 @@ def execute(operation, data):
                     os.fchmod(staged.fileno(), path.stat().st_mode & 0o777)
             os.replace(staged.name, path)
             content, state = read_resource(data["resource"])
+            if NAME == "pause_after_commit":
+                marker = pathlib.Path(WORKSPACE) / "commit-completed.json"
+                commits = json.loads(marker.read_text())["commits"] if marker.exists() else 0
+                staged_marker = marker.with_suffix(".tmp")
+                staged_marker.write_text(json.dumps({"commits": commits + 1, "pid": os.getpid()}))
+                staged_marker.replace(marker)
+                time.sleep(60)
             return {"content_hash": hashlib.sha256(content).hexdigest(), "state": state}
     if operation == "check_plan":
         baseline = data["link"]["occurrences"][0]["declaration"]["annotation"]

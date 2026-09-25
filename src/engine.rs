@@ -12,16 +12,16 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use url::Url;
 
-pub struct Engine {
+pub struct Engine<'host> {
     pub session: Session,
     manifests: BTreeMap<String, Manifest>,
     resolutions: BTreeMap<String, std::result::Result<Region, String>>,
-    workers: BTreeMap<String, process::Worker>,
+    pub(crate) host: &'host mut process::Host,
     failed_manifests: BTreeMap<String, String>,
 }
 
-impl Engine {
-    pub fn new(session: Session) -> Result<Self> {
+impl<'host> Engine<'host> {
+    pub fn new(session: Session, host: &'host mut process::Host) -> Result<Self> {
         let manifests = BTreeMap::new();
         let mut schemes = BTreeSet::new();
         for (name, config) in &session.workspace.config.extensions {
@@ -36,12 +36,12 @@ impl Engine {
             session,
             manifests,
             resolutions: BTreeMap::new(),
-            workers: BTreeMap::new(),
+            host,
             failed_manifests: BTreeMap::new(),
         })
     }
 
-    pub fn manifest(&mut self, name: &str) -> Result<Manifest> {
+    pub async fn manifest(&mut self, name: &str) -> Result<Manifest> {
         if let Some(manifest) = self.manifests.get(name) {
             return Ok(manifest.clone());
         }
@@ -55,25 +55,24 @@ impl Engine {
             .extensions
             .get(name)
             .with_context(|| format!("unknown extension: {name}"))?;
-        let started = (|| -> Result<_> {
-            let mut worker = process::Worker::spawn(&self.session.workspace.root, config)?;
-            let manifest = worker.describe(name, &config.revision)?;
-            Ok((worker, manifest))
-        })();
-        let (worker, manifest) = match started {
-            Ok(result) => result,
+        let result = self
+            .host
+            .worker(&self.session.workspace.root, name, config)?
+            .describe(name, &config.revision)
+            .await;
+        let manifest = match result {
+            Ok(manifest) => manifest,
             Err(error) => {
                 self.failed_manifests
                     .insert(name.to_owned(), format!("{error:#}"));
                 return Err(error);
             }
         };
-        self.workers.insert(name.to_owned(), worker);
         self.manifests.insert(name.to_owned(), manifest.clone());
         Ok(manifest)
     }
 
-    pub fn manifests(&mut self) -> Result<Vec<Manifest>> {
+    pub async fn manifests(&mut self) -> Result<Vec<Manifest>> {
         let names: Vec<_> = self
             .session
             .workspace
@@ -83,24 +82,25 @@ impl Engine {
             .cloned()
             .collect();
         for name in names {
-            self.manifest(&name)?;
+            self.manifest(&name).await?;
         }
         Ok(self.manifests.values().cloned().collect())
     }
 
-    pub fn call(&mut self, name: &str, operation: &str, input: Value) -> Result<Value> {
+    pub async fn call(&mut self, name: &str, operation: &str, input: Value) -> Result<Value> {
         ensure!(
-            self.manifest(name)?.supports(operation),
+            self.manifest(name).await?.supports(operation),
             "extension {name} does not support {operation}"
         );
-        self.workers
-            .get_mut(name)
-            .expect("manifest has a worker")
+        let config = &self.session.workspace.config.extensions[name];
+        self.host
+            .worker(&self.session.workspace.root, name, config)?
             .invoke(operation, input)
+            .await
     }
 
-    pub fn observe(&mut self, resource: &str) -> Result<Observation> {
-        let resource = self.session.workspace.resource(resource)?;
+    pub async fn observe(&mut self, resource: &str) -> Result<Observation> {
+        let resource = self.session.workspace.resource(resource).await?;
         if let Some(observation) = self.session.snapshot.observations.get(&resource) {
             return Ok(observation.clone());
         }
@@ -112,7 +112,7 @@ impl Engine {
             "resource was not observed in this snapshot: {resource}"
         );
         let url = Url::parse(&resource)?;
-        let result = (|| -> Result<Observation> {
+        let result = (async {
             let name = self
                 .session
                 .workspace
@@ -122,7 +122,9 @@ impl Engine {
                 .find(|(_, config)| config.schemes.iter().any(|scheme| scheme == url.scheme()))
                 .map(|(name, _)| name.clone())
                 .with_context(|| format!("no resource provider for scheme {}", url.scheme()))?;
-            let result = self.call(&name, "observe", json!({"resource": resource}))?;
+            let result = self
+                .call(&name, "observe", json!({"resource": resource}))
+                .await?;
             #[derive(serde::Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Observed {
@@ -133,7 +135,9 @@ impl Engine {
                 serde_json::from_value(result).context("invalid observe result")?;
             self.session
                 .record(resource.clone(), result.bytes, name, result.state)
-        })();
+                .await
+        })
+        .await;
         if let Err(error) = &result {
             self.session.snapshot.failures.insert(
                 resource.clone(),
@@ -147,14 +151,14 @@ impl Engine {
         result
     }
 
-    pub fn observation_input(&mut self, observation: &Observation) -> Result<Value> {
-        self.session.bytes(observation)?;
+    pub async fn observation_input(&mut self, observation: &Observation) -> Result<Value> {
+        self.session.bytes(observation).await?;
         Ok(
             json!({"observation": observation, "content_path": self.session.workspace.blob_path(observation)?}),
         )
     }
 
-    pub fn observations_input(&mut self) -> Result<Vec<Value>> {
+    pub async fn observations_input(&mut self) -> Result<Vec<Value>> {
         let observations: Vec<_> = self
             .session
             .snapshot
@@ -162,13 +166,14 @@ impl Engine {
             .values()
             .cloned()
             .collect();
-        observations
-            .iter()
-            .map(|observation| self.observation_input(observation))
-            .collect()
+        let mut inputs = Vec::with_capacity(observations.len());
+        for observation in &observations {
+            inputs.push(self.observation_input(observation).await?);
+        }
+        Ok(inputs)
     }
 
-    fn resolution_observations(&mut self, ids: &[String]) -> Result<Vec<Value>> {
+    async fn resolution_observations(&mut self, ids: &[String]) -> Result<Vec<Value>> {
         let observations: Vec<_> = ids
             .iter()
             .map(|id| {
@@ -183,26 +188,28 @@ impl Engine {
                     })
             })
             .collect::<Result<_>>()?;
-        observations
-            .iter()
-            .map(|observation| self.observation_input(observation))
-            .collect()
+        let mut inputs = Vec::with_capacity(observations.len());
+        for observation in &observations {
+            inputs.push(self.observation_input(observation).await?);
+        }
+        Ok(inputs)
     }
 
-    pub fn resolve(&mut self, selector: &Selector) -> Result<Region> {
+    pub async fn resolve(&mut self, selector: &Selector) -> Result<Region> {
         let key = serde_json::to_string(&selector)?;
         if let Some(result) = self.resolutions.get(&key) {
             return result.clone().map_err(anyhow::Error::msg);
         }
         let result = self
             .resolve_uncached(selector)
+            .await
             .map_err(|error| format!("{error:#}"));
         self.resolutions.insert(key, result.clone());
         result.map_err(anyhow::Error::msg)
     }
 
-    pub(crate) fn resolve_uncached(&mut self, selector: &Selector) -> Result<Region> {
-        let manifest = self.manifest(&selector.extension)?;
+    pub(crate) async fn resolve_uncached(&mut self, selector: &Selector) -> Result<Region> {
+        let manifest = self.manifest(&selector.extension).await?;
         ensure!(
             manifest.supports("resolve"),
             "extension {} does not resolve regions",
@@ -215,16 +222,19 @@ impl Engine {
             ids.clone()
         } else {
             loop {
-                let observations = self.observations_input()?;
-                let resources: Vec<String> = serde_json::from_value(self.call(
-                    &selector.extension,
-                    "dependencies",
-                    json!({"selector": selector, "observations": observations}),
-                )?)
+                let observations = self.observations_input().await?;
+                let resources: Vec<String> = serde_json::from_value(
+                    self.call(
+                        &selector.extension,
+                        "dependencies",
+                        json!({"selector": selector, "observations": observations}),
+                    )
+                    .await?,
+                )
                 .context("dependencies result must be a resource array")?;
                 let before = self.session.snapshot.observations.len();
                 for resource in resources {
-                    let observation = self.observe(&resource)?;
+                    let observation = self.observe(&resource).await?;
                     ensure!(
                         observation.state.exists,
                         "resource does not exist: {}",
@@ -248,12 +258,15 @@ impl Engine {
                 .insert(key, ids.clone());
             ids
         };
-        let observations = self.resolution_observations(&ids)?;
-        let region: Region = serde_json::from_value(self.call(
-            &selector.extension,
-            "resolve",
-            json!({"selector": selector, "observations": observations}),
-        )?)
+        let observations = self.resolution_observations(&ids).await?;
+        let region: Region = serde_json::from_value(
+            self.call(
+                &selector.extension,
+                "resolve",
+                json!({"selector": selector, "observations": observations}),
+            )
+            .await?,
+        )
         .context("invalid region result")?;
         ensure!(
             manifest.domains.contains(&region.domain),
@@ -269,7 +282,7 @@ impl Engine {
         Ok(region)
     }
 
-    pub fn compare(&mut self, left: &Region, right: &Region) -> Result<Relation> {
+    pub async fn compare(&mut self, left: &Region, right: &Region) -> Result<Relation> {
         ensure!(
             left.domain == right.domain,
             "no shared comparison domain: {} and {}",
@@ -284,7 +297,7 @@ impl Engine {
             .get(&left.domain)
             .cloned()
         {
-            let manifest = self.manifest(&name)?;
+            let manifest = self.manifest(&name).await?;
             ensure!(
                 manifest.domains.contains(&left.domain) && manifest.supports("compare"),
                 "configured comparator {name} does not compare {}",
@@ -293,7 +306,8 @@ impl Engine {
             manifest
         } else {
             let mut candidates: Vec<_> = self
-                .manifests()?
+                .manifests()
+                .await?
                 .into_iter()
                 .filter(|manifest| {
                     manifest.domains.contains(&left.domain) && manifest.supports("compare")
@@ -311,15 +325,18 @@ impl Engine {
             );
             candidates.remove(0)
         };
-        serde_json::from_value(self.call(
-            &owner.name,
-            "compare",
-            json!({"left": left, "right": right}),
-        )?)
+        serde_json::from_value(
+            self.call(
+                &owner.name,
+                "compare",
+                json!({"left": left, "right": right}),
+            )
+            .await?,
+        )
         .context("invalid comparison result")
     }
 
-    pub fn sources(&mut self) -> Result<Vec<SnapshotSource>> {
+    pub async fn sources(&mut self) -> Result<Vec<SnapshotSource>> {
         if let Some(sources) = &self.session.snapshot.sources {
             return Ok(sources.clone());
         }
@@ -342,22 +359,26 @@ impl Engine {
         let mut sources = Vec::new();
         for source in &workspace.config.resources {
             sources.push(SnapshotSource {
-                resource: workspace.resource(&source.resource)?,
+                resource: workspace.resource(&source.resource).await?,
                 extension: source.extension.clone(),
             });
         }
         let mut diagnostics = Vec::new();
         if !matchers.is_empty() {
             let root = workspace.root.clone();
-            let walker = ignore::WalkBuilder::new(&root)
-                .hidden(false)
-                .git_global(false)
-                .require_git(false)
-                .filter_entry(move |entry| {
-                    entry.path() != root.join(".monika") && entry.path() != root.join(".git")
-                })
-                .build();
-            for entry in walker {
+            let entries = tokio::task::spawn_blocking(move || {
+                ignore::WalkBuilder::new(&root)
+                    .hidden(false)
+                    .git_global(false)
+                    .require_git(false)
+                    .filter_entry(move |entry| {
+                        entry.path() != root.join(".monika") && entry.path() != root.join(".git")
+                    })
+                    .build()
+                    .collect::<Vec<_>>()
+            })
+            .await?;
+            for entry in entries {
                 match entry {
                     Ok(entry) => {
                         if let Some(error) = entry.error() {
@@ -377,8 +398,7 @@ impl Engine {
                         for (matcher, extension) in &matchers {
                             if matcher.is_match(relative) {
                                 sources.push(SnapshotSource {
-                                    resource: workspace
-                                        .resource(&entry.path().to_string_lossy())?,
+                                    resource: workspace.path_resource(entry.path()).await?,
                                     extension: extension.clone(),
                                 });
                             }
@@ -399,28 +419,28 @@ impl Engine {
         Ok(sources)
     }
 
-    pub fn extract(&mut self) -> Result<Extraction> {
-        let sources = self.sources()?;
+    pub async fn extract(&mut self) -> Result<Extraction> {
+        let sources = self.sources().await?;
         let mut result = Extraction {
             occurrences: Vec::new(),
             diagnostics: self.session.snapshot.diagnostics.clone(),
         };
         for source in sources {
-            let extracted = (|| -> Result<Extraction> {
+            let extracted = (async {
                 ensure!(
-                    self.manifest(&source.extension)?.supports("extract"),
+                    self.manifest(&source.extension).await?.supports("extract"),
                     "extension {} does not extract declarations",
                     source.extension
                 );
-                let observation = self.observe(&source.resource)?;
+                let observation = self.observe(&source.resource).await?;
                 ensure!(
                     observation.state.exists,
                     "resource does not exist: {}",
                     observation.resource
                 );
-                let input = self.observation_input(&observation)?;
+                let input = self.observation_input(&observation).await?;
                 let extraction: Extraction =
-                    serde_json::from_value(self.call(&source.extension, "extract", input)?)?;
+                    serde_json::from_value(self.call(&source.extension, "extract", input).await?)?;
                 for occurrence in &extraction.occurrences {
                     occurrence.declaration.validate()?;
                     ensure!(
@@ -432,7 +452,8 @@ impl Engine {
                     );
                 }
                 Ok(extraction)
-            })();
+            })
+            .await;
             match extracted {
                 Ok(extracted) => {
                     result.occurrences.extend(extracted.occurrences);

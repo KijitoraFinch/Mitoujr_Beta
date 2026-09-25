@@ -21,7 +21,7 @@ pub struct TestFailure {
 
 /// Test the extension's real operations, bypassing resolution caches. Input
 /// indices identify the supplied selectors, so failed laws can be reproduced.
-pub fn test_regions(engine: &mut Engine, selectors: &[Selector]) -> Result<TestReport> {
+pub async fn test_regions(engine: &mut Engine<'_>, selectors: &[Selector]) -> Result<TestReport> {
     ensure!(
         !selectors.is_empty(),
         "extension tests require at least one selector"
@@ -35,9 +35,9 @@ pub fn test_regions(engine: &mut Engine, selectors: &[Selector]) -> Result<TestR
     };
     let mut regions = Vec::new();
     for (index, selector) in selectors.iter().enumerate() {
-        match engine.resolve_uncached(selector) {
+        match engine.resolve_uncached(selector).await {
             Ok(region) => {
-                match engine.resolve_uncached(selector) {
+                match engine.resolve_uncached(selector).await {
                     Ok(repeated) if repeated == region => {}
                     Ok(_) => report.fail(
                         "resolution_determinism",
@@ -66,7 +66,7 @@ pub fn test_regions(engine: &mut Engine, selectors: &[Selector]) -> Result<TestR
                 continue;
             };
             report.comparison_calls += 1;
-            match engine.compare(left, right) {
+            match engine.compare(left, right).await {
                 Ok(relation) => {
                     if relation == Relation::Equal
                         && let (Some(left), Some(right)) =
@@ -81,7 +81,7 @@ pub fn test_regions(engine: &mut Engine, selectors: &[Selector]) -> Result<TestR
                     }
                     comparisons[a][b] = Some(relation);
                     report.comparison_calls += 1;
-                    match engine.compare(left, right) {
+                    match engine.compare(left, right).await {
                         Ok(repeated) if repeated == relation => {}
                         Ok(_) => report.fail(
                             "comparison_determinism",
@@ -103,6 +103,7 @@ pub fn test_regions(engine: &mut Engine, selectors: &[Selector]) -> Result<TestR
     }
     let includes = |relation| matches!(relation, Some(Relation::Equal | Relation::Contains));
     for a in 0..count {
+        tokio::task::yield_now().await;
         if comparisons[a][a].is_some_and(|relation| relation != Relation::Equal) {
             report.fail("reflexivity", vec![a], "a region must equal itself");
         }

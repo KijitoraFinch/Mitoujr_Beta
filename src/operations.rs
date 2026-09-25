@@ -87,11 +87,11 @@ pub struct Selection {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-pub fn select(engine: &mut Engine, filter: Option<&Expression>) -> Result<Selection> {
+pub async fn select(engine: &mut Engine<'_>, filter: Option<&Expression>) -> Result<Selection> {
     if let Some(filter) = filter {
         filter.validate()?;
     }
-    let graph = graph::build(engine)?;
+    let graph = graph::build(engine).await?;
     let mut result = Selection {
         links: Vec::new(),
         undetermined: Vec::new(),
@@ -100,7 +100,12 @@ pub fn select(engine: &mut Engine, filter: Option<&Expression>) -> Result<Select
         diagnostics: graph.diagnostics,
     };
     for link in graph.links {
-        match filter.map_or(Ok(true), |filter| filter.evaluate(engine, &link)) {
+        tokio::task::yield_now().await;
+        let matches = match filter {
+            Some(filter) => filter.evaluate(engine, &link).await,
+            None => Ok(true),
+        };
+        match matches {
             Ok(true) => result.links.push(link),
             Ok(false) => {}
             Err(error) => result.undetermined.push(UnknownMatch {
@@ -163,8 +168,8 @@ struct CheckRegionInput {
     snapshot: Option<String>,
 }
 
-pub fn check(engine: &mut Engine, filter: Option<&Expression>) -> Result<CheckResult> {
-    let mut selection = select(engine, filter)?;
+pub async fn check(engine: &mut Engine<'_>, filter: Option<&Expression>) -> Result<CheckResult> {
+    let mut selection = select(engine, filter).await?;
     let mut findings = Vec::new();
     let checkers = engine.session.workspace.config.checks.clone();
     for link in &selection.links {
@@ -189,12 +194,12 @@ pub fn check(engine: &mut Engine, filter: Option<&Expression>) -> Result<CheckRe
             findings: endpoints,
         });
         for checker in &checkers {
-            let result = (|| -> Result<Vec<CheckFinding>> {
+            let result = (async {
                 let plan: Vec<CheckRegionInput> = serde_json::from_value(engine.call(
                     &checker.extension,
                     "check_plan",
                     json!({"link": link.extension_input(), "options": checker.options}),
-                )?)
+                ).await?)
                 .context("invalid check_plan response")?;
                 let mut regions = BTreeMap::new();
                 for input in plan {
@@ -207,16 +212,16 @@ pub fn check(engine: &mut Engine, filter: Option<&Expression>) -> Result<CheckRe
                         let mut historical = Engine::new(Session::replay(
                             engine.session.workspace.clone(),
                             &snapshot,
-                        )?)?;
+                        ).await?, engine.host)?;
                         let selector = input
                             .target
                             .expand(&historical.session.workspace.config.names)?;
-                        historical.resolve(&selector)?
+                        historical.resolve(&selector).await?
                     } else {
                         let selector = input
                             .target
                             .expand(&engine.session.workspace.config.names)?;
-                        engine.resolve(&selector)?
+                        engine.resolve(&selector).await?
                     };
                     regions.insert(input.name, region);
                 }
@@ -224,9 +229,9 @@ pub fn check(engine: &mut Engine, filter: Option<&Expression>) -> Result<CheckRe
                     &checker.extension,
                     "check",
                     json!({"link": link.extension_input(), "options": checker.options, "regions": regions}),
-                )?)
+                ).await?)
                 .context("invalid check response")
-            })();
+            }).await;
             match result {
                 Ok(result) => findings.push(LinkFindings {
                     key: link.key.clone(),
@@ -257,12 +262,19 @@ pub fn check(engine: &mut Engine, filter: Option<&Expression>) -> Result<CheckRe
     })
 }
 
-pub fn execute(workspace: Workspace, snapshot: Option<&str>, operation: Operation) -> Response {
+pub async fn execute(
+    workspace: Workspace,
+    snapshot: Option<&str>,
+    operation: Operation,
+    host: &mut crate::extensions::process::Host,
+) -> Response {
     if let Operation::Init = operation {
-        return match (|| -> Result<Value> {
+        return match (async {
             ensure!(snapshot.is_none(), "init does not accept --snapshot");
-            Ok(json!({"config": workspace.initialize()?}))
-        })() {
+            Ok::<_, anyhow::Error>(json!({"config": workspace.initialize().await?}))
+        })
+        .await
+        {
             Ok(data) => Response {
                 schema: 1,
                 ok: true,
@@ -275,26 +287,30 @@ pub fn execute(workspace: Workspace, snapshot: Option<&str>, operation: Operatio
             Err(error) => Response::error(format!("{error:#}")),
         };
     }
-    let prepared = (|| -> Result<Engine> {
-        Engine::new(match snapshot {
-            Some(id) => Session::replay(workspace, id)?,
-            None => Session::new(workspace)?,
-        })
-    })();
+    let prepared = (async {
+        Engine::new(
+            match snapshot {
+                Some(id) => Session::replay(workspace, id).await?,
+                None => Session::new(workspace)?,
+            },
+            host,
+        )
+    })
+    .await;
     let mut engine = match prepared {
         Ok(engine) => engine,
         Err(error) => return Response::error(format!("{error:#}")),
     };
-    let result = (|| -> Result<(Value, bool, u8)> {
+    let result: Result<(Value, bool, u8)> = (async {
         Ok(match operation {
             Operation::Init => unreachable!(),
             Operation::Show { target } => {
                 let selector = target.expand(&engine.session.workspace.config.names)?;
-                let region = engine.resolve(&selector)?;
+                let region = engine.resolve(&selector).await?;
                 (json!({"selector": selector, "region": region}), true, 0)
             }
             Operation::Links { filter } => {
-                let selected = select(&mut engine, filter.as_ref())?;
+                let selected = select(&mut engine, filter.as_ref()).await?;
                 let complete = selected.complete;
                 (
                     serde_json::to_value(selected)?,
@@ -303,7 +319,7 @@ pub fn execute(workspace: Workspace, snapshot: Option<&str>, operation: Operatio
                 )
             }
             Operation::Check { filter } => {
-                let checked = check(&mut engine, filter.as_ref())?;
+                let checked = check(&mut engine, filter.as_ref()).await?;
                 let complete = checked.selection.complete;
                 let exit = if !complete {
                     2
@@ -314,12 +330,12 @@ pub fn execute(workspace: Workspace, snapshot: Option<&str>, operation: Operatio
                 };
                 (serde_json::to_value(checked)?, complete, exit)
             }
-            Operation::ExtensionList => (serde_json::to_value(engine.manifests()?)?, true, 0),
+            Operation::ExtensionList => (serde_json::to_value(engine.manifests().await?)?, true, 0),
             Operation::ExtensionShow { name } => {
-                (serde_json::to_value(engine.manifest(&name)?)?, true, 0)
+                (serde_json::to_value(engine.manifest(&name).await?)?, true, 0)
             }
             Operation::ExtensionTest { selectors } => {
-                let report = extension_test::test_regions(&mut engine, &selectors)?;
+                let report = extension_test::test_regions(&mut engine, &selectors).await?;
                 let complete = report.complete;
                 let exit = if !complete {
                     2
@@ -335,37 +351,27 @@ pub fn execute(workspace: Workspace, snapshot: Option<&str>, operation: Operatio
                 change,
                 patch_out,
             } => {
-                let patch = editing::prepare(&mut engine, &destination, &change)?;
+                let patch = editing::prepare(&mut engine, &destination, &change).await?;
                 let data = if let Some(path) = patch_out {
-                    use std::io::Write;
-                    let path = if path.is_absolute() {
-                        path
-                    } else {
-                        engine.session.workspace.root.join(path)
-                    };
-                    let parent = path.parent().context("patch path has no parent")?;
-                    let mut staged = tempfile::NamedTempFile::new_in(parent)?;
-                    serde_json::to_writer_pretty(staged.as_file_mut(), &patch)?;
-                    staged.write_all(b"\n")?;
-                    staged.as_file().sync_all()?;
-                    staged
-                        .persist_noclobber(&path)
-                        .map_err(|error| error.error)
+                    let path = engine.session.workspace.root.join(path);
+                    let mut bytes = serde_json::to_vec_pretty(&patch)?;
+                    bytes.push(b'\n');
+                    engine.session.workspace.publish_new(&path, &bytes, false).await
                         .context("save patch (destination must not exist)")?;
                     json!({"patch": patch, "path": path, "applied": false})
                 } else {
-                    json!({"patch": patch.id, "applied": true, "commit": editing::apply(&mut engine, &patch)?})
+                    json!({"patch": patch.id, "applied": true, "commit": editing::apply(&mut engine, &patch).await?})
                 };
                 (data, true, 0)
             }
             Operation::Apply { patch } => (
-                json!({"patch": patch.id, "applied": true, "commit": editing::apply(&mut engine, &patch)?}),
+                json!({"patch": patch.id, "applied": true, "commit": editing::apply(&mut engine, &patch).await?}),
                 true,
                 0,
             ),
         })
-    })();
-    let snapshot = match engine.session.save() {
+    }).await;
+    let snapshot = match engine.session.save().await {
         Ok(snapshot) => snapshot,
         Err(error) => return Response::error(format!("save observations: {error:#}")),
     };
