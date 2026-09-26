@@ -1,6 +1,4 @@
-use crate::model::{
-    Observation, ResourceState, Snapshot, SnapshotSource, Target, digest, require_version,
-};
+use crate::model::{Observation, ResourceState, Snapshot, Target, digest, require_version};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -14,9 +12,6 @@ use url::Url;
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub version: u32,
-    pub sources: Vec<Source>,
-    #[serde(default)]
-    pub resources: Vec<SnapshotSource>,
     #[serde(default)]
     pub names: BTreeMap<String, Target>,
     #[serde(default)]
@@ -33,13 +28,6 @@ pub struct CheckSpec {
     pub extension: String,
     #[serde(default)]
     pub options: serde_json::Value,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Source {
-    pub pattern: String,
-    pub extension: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -62,8 +50,6 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             version: 1,
-            sources: Vec::new(),
-            resources: Vec::new(),
             names: BTreeMap::new(),
             extensions: BTreeMap::new(),
             comparators: BTreeMap::new(),
@@ -163,7 +149,18 @@ impl Workspace {
         );
         let mut bytes = serde_json::to_vec_pretty(&self.config)?;
         bytes.push(b'\n');
+        ensure!(
+            !fs::try_exists(self.root.join(crate::sidecar::FILE_NAME)).await?,
+            "Sidecar already exists"
+        );
+        let sidecar = crate::sidecar::SidecarState {
+            content_hash: None,
+            data: crate::sidecar::Sidecar::default(),
+        };
         self.publish_new(&path, &bytes, false).await?;
+        let mut initial = sidecar.data.clone();
+        initial.revision = 1;
+        crate::sidecar::commit(self, &sidecar, &initial).await?;
         Ok(path)
     }
 
@@ -314,6 +311,9 @@ impl Workspace {
             snapshot.root == self.root.to_string_lossy(),
             "snapshot belongs to a different workspace"
         );
+        if let Some(sidecar) = &snapshot.sidecar {
+            sidecar.data.validate()?;
+        }
         for (resource, observation) in &snapshot.observations {
             ensure!(
                 resource == &observation.resource,
@@ -362,8 +362,7 @@ impl Session {
             interpretation: serde_json::to_value(&workspace.config)?,
             observations: BTreeMap::new(),
             failures: BTreeMap::new(),
-            sources: None,
-            diagnostics: Vec::new(),
+            sidecar: None,
             resolution_reads: BTreeMap::new(),
         };
         Ok(Self {

@@ -1,5 +1,5 @@
 use crate::engine::Engine;
-use crate::model::{Relation, Selector};
+use crate::model::{RegionSelector, Relation};
 use anyhow::{Result, ensure};
 use serde::Serialize;
 
@@ -21,7 +21,10 @@ pub struct TestFailure {
 
 /// Test the extension's real operations, bypassing resolution caches. Input
 /// indices identify the supplied selectors, so failed laws can be reproduced.
-pub async fn test_regions(engine: &mut Engine<'_>, selectors: &[Selector]) -> Result<TestReport> {
+pub async fn test_regions(
+    engine: &mut Engine<'_>,
+    selectors: &[RegionSelector],
+) -> Result<TestReport> {
     ensure!(
         !selectors.is_empty(),
         "extension tests require at least one selector"
@@ -68,17 +71,6 @@ pub async fn test_regions(engine: &mut Engine<'_>, selectors: &[Selector]) -> Re
             report.comparison_calls += 1;
             match engine.compare(left, right).await {
                 Ok(relation) => {
-                    if relation == Relation::Equal
-                        && let (Some(left), Some(right)) =
-                            (&left.equivalence_key, &right.equivalence_key)
-                        && left != right
-                    {
-                        report.fail(
-                            "equivalence_key",
-                            vec![a, b],
-                            "equal regions must use the same equivalence key",
-                        );
-                    }
                     comparisons[a][b] = Some(relation);
                     report.comparison_calls += 1;
                     match engine.compare(left, right).await {

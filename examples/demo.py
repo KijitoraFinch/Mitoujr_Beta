@@ -15,10 +15,6 @@ def demonstrate(binary, directory):
     extension = REPOSITORY / "tests" / "fixtures" / "sets_extension.py"
     config = {
         "version": 1,
-        "sources": [
-            {"pattern": "*.links", "extension": "sets"},
-            {"pattern": "*.jsonl", "extension": "lines"},
-        ],
         "extensions": {
             "sets": {"command": ["python3", str(extension)], "revision": "test-v1", "schemes": ["file"]},
             "lines": {"command": ["python3", str(extension), "lines"], "revision": "test-v1"},
@@ -43,7 +39,7 @@ def demonstrate(binary, directory):
     run("init")
     (directory / "monika.json").write_text(json.dumps(config, indent=2) + "\n")
     (directory / "rows.json").write_text("[1, 2, 3]\n")
-    declaration = {
+    link = {
         "id": "design-to-data",
         "source": {"extension": "sets", "resource": "rows.json", "query": "0"},
         "reference": {"target": {"name": "subset"}},
@@ -53,9 +49,9 @@ def demonstrate(binary, directory):
     run("extension", "show", "sets")
     shown = run("show", "@subset")
     assert shown["data"]["region"]["content"]["count"] == 2
-    run("link", "add", "--in", "design.links", "--extension", "sets", "--declaration", "-", value=declaration)
+    run("link", "add", "--link", "-", value=link)
     links = run("links")
-    assert links["data"]["links"][0]["occurrences"][0]["declaration"] == declaration
+    assert links["data"]["links"][0]["annotation"] == link["annotation"]
     run("links", "--where", 'annotation.relation == "supports" and target within region("@subset")')
     run("links", "--to", "@subset", "--within")
     run("check")
@@ -63,13 +59,21 @@ def demonstrate(binary, directory):
         "op": "compare", "field": "annotation.relation", "relation": "equal",
         "value": {"kind": "json", "value": "supports"},
     }})
-    declaration["annotation"]["review"] = {"owner": "利用者", "notes": [None, "reviewed"]}
-    prepared = run("link", "set", "--in", "design.links", "--extension", "sets", "--id", "design-to-data", "--declaration", "-", "--patch-out", "review.patch.json", value=declaration)
+    link["annotation"]["review"] = {"owner": "利用者", "notes": [None, "reviewed"]}
+    prepared = run("link", "set", "--link", "-", "--patch-out", "review.patch.json", value=link)
     assert prepared["data"]["applied"] is False
     run("apply", str(directory / "review.patch.json"))
-    run("link", "copy", "--from", "design.links", "--from-extension", "sets", "--id", "design-to-data", "--in", "copy.jsonl", "--extension", "lines")
-    assert json.loads((directory / "copy.jsonl").read_text()) == declaration
-    run("link", "remove", "--in", "copy.jsonl", "--extension", "lines", "--at", '{"index":0}')
+    current = run("links")["data"]["links"][0]
+    run("generate", "output.jsonl", "--extension", "lines")
+    assert json.loads((directory / "output.jsonl").read_text()) == current
+    run("link", "remove", "design-to-data")
+    run("import", "output.jsonl", "--extension", "lines")
+    imported = run("links")
+    assert imported["data"]["links"][0] == current
+    assert len(imported["data"]["origins"]) == 1
+    before_repeat = (directory / "monika.links.json").read_bytes()
+    run("import", "output.jsonl", "--extension", "lines")
+    assert (directory / "monika.links.json").read_bytes() == before_repeat
     cases = [{"extension": "sets", "resource": "rows.json", "query": str(minimum)} for minimum in [0, 2, 3, 4]]
     tested = run("extension", "test", "--cases", "-", value=cases)
     assert tested["data"]["passed"]

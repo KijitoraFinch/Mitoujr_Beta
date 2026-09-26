@@ -1,10 +1,10 @@
 use anyhow::Result;
 use monika::engine::Engine;
 use monika::extensions::process::Host;
-use monika::model::Selector;
+use monika::model::RegionSelector;
 use monika::operations;
 use monika::query::Expression;
-use monika::workspace::{Config, ProcessExtension, Session, Source, Workspace};
+use monika::workspace::{Config, ProcessExtension, Session, Workspace};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::fs;
@@ -45,10 +45,6 @@ async fn workspace(root: &Path, split_provider: bool, timeout_ms: u64) -> Result
             extension("provider", vec!["file".into()], 5_000),
         );
     }
-    config.sources.push(Source {
-        pattern: "*.links".into(),
-        extension: "sets".into(),
-    });
     config
         .comparators
         .insert("test.sets.v1".into(), "sets".into());
@@ -56,8 +52,8 @@ async fn workspace(root: &Path, split_provider: bool, timeout_ms: u64) -> Result
     Workspace::open(root).await
 }
 
-fn selector(query: Value) -> Selector {
-    Selector {
+fn selector(query: Value) -> RegionSelector {
+    RegionSelector {
         extension: "sets".into(),
         resource: None,
         query,
@@ -196,7 +192,7 @@ async fn failed_reads_cannot_be_hidden_and_replay_does_not_retry_them() -> Resul
     fs::write(dir.path().join("good.json"), "[7]")?;
     assert_eq!(
         engine
-            .resolve(&Selector::parse("sets:good.json#0")?)
+            .resolve(&RegionSelector::parse("sets:good.json#0")?)
             .await?
             .content["count"],
         1
@@ -333,22 +329,21 @@ async fn cancellation_while_a_provider_is_pending_closes_both_processes() -> Res
 }
 
 #[tokio::test]
-async fn narrow_query_keeps_observation_traffic_and_snapshots_linear() -> Result<()> {
+async fn narrow_query_does_not_acquire_resources_or_start_extensions() -> Result<()> {
     let mut sizes = Vec::new();
     for count in [100, 600] {
         let dir = tempfile::tempdir()?;
         let workspace = workspace(dir.path(), false, 10_000).await?;
-        let mut declarations = Vec::new();
+        let mut links = Vec::new();
         for i in 0..count {
-            let name = format!("rows-{i:04}.json");
-            fs::write(dir.path().join(&name), "[1,2,3]")?;
-            let target = json!({"extension":"sets", "resource":name, "query":"0"});
-            declarations.push(json!({"id":i.to_string(), "source":target,
-                "reference":{"target":target},"annotation":null}));
+            // These Resources intentionally do not exist.
+            let resource = workspace.resource(&format!("rows-{i:04}.json")).await?;
+            let target = json!({"extension":"sets", "resource":resource, "query":"0"});
+            links.push(json!({"id":i.to_string(), "source":target, "reference":{"target":target},"annotation":null}));
         }
         fs::write(
-            dir.path().join("notes.links"),
-            serde_json::to_vec(&json!({"links":declarations}))?,
+            dir.path().join("monika.links.json"),
+            serde_json::to_vec(&json!({"version":1,"revision":1,"links":links,"origins":[]}))?,
         )?;
         let mut host = Host::default();
         let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
@@ -357,40 +352,25 @@ async fn narrow_query_keeps_observation_traffic_and_snapshots_linear() -> Result
             operations::select(&mut engine, Some(&Expression::parse("id == \"0\"")?)).await?;
         assert!(result.complete);
         assert_eq!(result.links.len(), 1);
-        // Query planning is deliberately a separate change. All endpoints are
-        // still resolved here; only the observation interface changed.
-        assert_eq!(engine.session.snapshot.observations.len(), count + 1);
-        assert_eq!(engine.session.snapshot.resolution_reads.len(), count);
-        assert!(
-            engine
-                .session
-                .snapshot
-                .resolution_reads
-                .values()
-                .all(|reads| reads.len() == 1)
-        );
+        assert_eq!(result.links[0].id, "0");
+        assert!(engine.session.snapshot.observations.is_empty());
+        assert!(engine.session.snapshot.resolution_reads.is_empty());
         let snapshot = engine.session.save().await?;
-        let elapsed = start.elapsed();
         host.shutdown(false).await?;
-        let messages = wire(dir.path())?;
-        assert_eq!(acquisitions(&messages), count + 1);
-        assert_eq!(deliveries(&messages), count);
         assert!(
-            !messages
-                .iter()
-                .any(|m| m["message"]["input"].get("observations").is_some())
+            !dir.path().join("wire.jsonl").exists(),
+            "query started an extension"
         );
         let size = fs::metadata(dir.path().join(".monika/snapshots").join(snapshot))?.len();
         sizes.push(size);
         eprintln!(
-            "links={count}, observed={}, metadata_sent={}, snapshot_bytes={size}, elapsed={elapsed:?}",
-            count + 1,
-            deliveries(&messages)
+            "links={count}, observed=0, metadata_sent=0, snapshot_bytes={size}, elapsed={:?}",
+            start.elapsed()
         );
     }
     assert!(
         sizes[1] < sizes[0] * 7,
-        "snapshot grew faster than dependency count: {sizes:?}"
+        "Sidecar snapshot grew superlinearly: {sizes:?}"
     );
     Ok(())
 }

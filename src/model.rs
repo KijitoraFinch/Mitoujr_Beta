@@ -10,7 +10,7 @@ pub fn digest(bytes: &[u8]) -> String {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Selector {
+pub struct RegionSelector {
     pub extension: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
@@ -18,7 +18,7 @@ pub struct Selector {
     pub query: Value,
 }
 
-impl Selector {
+impl RegionSelector {
     /// The short spelling is a CLI convenience. The query remains extension-owned.
     pub fn parse(input: &str) -> Result<Self> {
         if input.trim_start().starts_with('{') {
@@ -42,7 +42,7 @@ impl Selector {
 #[serde(untagged)]
 pub enum Target {
     Named(NamedTarget),
-    Selector(Selector),
+    RegionSelector(RegionSelector),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -52,12 +52,12 @@ pub struct NamedTarget {
 }
 
 impl Target {
-    pub fn expand(&self, names: &BTreeMap<String, Target>) -> Result<Selector> {
+    pub fn expand(&self, names: &BTreeMap<String, Target>) -> Result<RegionSelector> {
         let mut current = self;
         let mut visited = Vec::new();
         loop {
             match current {
-                Self::Selector(selector) => return Ok(selector.clone()),
+                Self::RegionSelector(selector) => return Ok(selector.clone()),
                 Self::Named(NamedTarget { name }) => {
                     ensure!(
                         !visited.contains(&name.as_str()),
@@ -82,25 +82,21 @@ pub struct Reference {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Declaration {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    pub source: Selector,
+pub struct Link {
+    pub id: String,
+    pub source: RegionSelector,
     pub reference: Reference,
     #[serde(default)]
     pub annotation: Value,
 }
 
-impl Declaration {
+impl Link {
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            self.id.as_ref().is_none_or(|id| !id.is_empty()),
-            "empty declaration ID"
-        );
+        ensure!(!self.id.trim().is_empty(), "empty Link ID");
         ensure!(!self.source.extension.is_empty(), "empty source extension");
         match &self.reference.target {
             Target::Named(named) => ensure!(!named.name.is_empty(), "empty named target"),
-            Target::Selector(selector) => {
+            Target::RegionSelector(selector) => {
                 ensure!(!selector.extension.is_empty(), "empty target extension")
             }
         }
@@ -127,6 +123,17 @@ pub struct ResourceState {
 }
 
 impl Observation {
+    pub fn validate_metadata(&self) -> Result<()> {
+        let mut value = self.clone();
+        value.id.clear();
+        ensure!(
+            digest(&serde_json::to_vec(&value)?) == self.id,
+            "corrupt Observation metadata: {}",
+            self.id
+        );
+        Ok(())
+    }
+
     pub fn new(
         resource: String,
         bytes: &[u8],
@@ -182,25 +189,16 @@ pub struct Snapshot {
     pub observations: BTreeMap<String, Observation>,
     /// Failures are persisted with successes; replay never silently retries live resources.
     pub failures: BTreeMap<String, Diagnostic>,
-    pub sources: Option<Vec<SnapshotSource>>,
-    pub diagnostics: Vec<Diagnostic>,
+    pub sidecar: Option<crate::sidecar::SidecarState>,
     /// Resource addresses actually requested by each selector, including absence
     /// and acquisition failures. Metadata and contents are stored once per session.
     pub resolution_reads: BTreeMap<String, BTreeSet<String>>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct SnapshotSource {
-    pub resource: String,
-    pub extension: String,
 }
 
 /// The region payload is interpreted exclusively by external extensions.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Region {
     pub domain: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub equivalence_key: Option<String>,
     pub identity: Value,
     pub observations: Vec<String>,
     pub content: Value,
@@ -246,8 +244,8 @@ mod tests {
                 .to_string()
                 .contains("unknown")
         );
-        let selector = Selector::parse("md:doc.md#hello").unwrap();
-        names.insert("b".into(), Target::Selector(selector.clone()));
+        let selector = RegionSelector::parse("md:doc.md#hello").unwrap();
+        names.insert("b".into(), Target::RegionSelector(selector.clone()));
         assert_eq!(named("a").expand(&names).unwrap(), selector);
         assert!(serde_json::from_value::<Target>(json!({"name":"a", "typo":1})).is_err());
     }

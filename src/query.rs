@@ -1,6 +1,6 @@
 use crate::engine::Engine;
-use crate::graph::Link;
-use crate::model::{NamedTarget, Relation, Selector, Target};
+use crate::model::Link;
+use crate::model::{NamedTarget, RegionSelector, Relation, Target};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -46,7 +46,7 @@ pub enum Predicate {
 pub enum Operand {
     Json(Value),
     Region(Target),
-    Selector(Target),
+    RegionSelector(Target),
 }
 
 pub fn target(input: &str) -> Result<Target> {
@@ -56,7 +56,7 @@ pub fn target(input: &str) -> Result<Target> {
     } else if input.trim_start().starts_with('{') {
         serde_json::from_str(input).context("invalid target JSON")
     } else {
-        Ok(Target::Selector(Selector::parse(input)?))
+        Ok(Target::RegionSelector(RegionSelector::parse(input)?))
     }
 }
 
@@ -97,7 +97,7 @@ impl Expression {
                 let parsed = Field::parse(field)?;
                 match (&parsed, value) {
                     (Field::Source | Field::Target, Operand::Region(_)) => {}
-                    (Field::Source | Field::Target, Operand::Selector(_)) => ensure!(
+                    (Field::Source | Field::Target, Operand::RegionSelector(_)) => ensure!(
                         matches!(relation, Predicate::Equal | Predicate::NotEqual),
                         "stored selectors support == and !="
                     ),
@@ -121,56 +121,60 @@ impl Expression {
             Self::Not { arg } => Ok(!Box::pin(arg.evaluate(engine, link)).await?),
             Self::Exists { field } => Ok(match Field::parse(field)? {
                 Field::Source | Field::Target => true,
-                Field::Id => !link.ids().is_empty(),
+                Field::Id => true,
                 Field::Annotation(path) => annotation(link, &path).is_some(),
             }),
             Self::Compare {
                 field,
                 relation,
                 value,
-            } => {
-                match (Field::parse(field)?, value) {
-                    (Field::Id, Operand::Json(expected)) => {
-                        let equal = expected.as_str().is_some_and(|id| link.ids().contains(id));
-                        equality(*relation, equal)
-                    }
-                    (Field::Annotation(path), Operand::Json(expected)) => {
-                        equality(*relation, annotation(link, &path) == Some(expected))
-                    }
-                    (field @ (Field::Source | Field::Target), Operand::Region(target)) => {
-                        let selector = target.expand(&engine.session.workspace.config.names)?;
-                        let expected = engine.resolve(&selector).await?;
-                        let actual = match field {
-                            Field::Source => &link.source,
-                            _ => &link.target,
-                        }
-                        .region()?;
-                        let comparison = engine.compare(actual, &expected).await?;
-                        Ok(match relation {
-                            Predicate::Equal => comparison == Relation::Equal,
-                            Predicate::NotEqual => comparison != Relation::Equal,
-                            Predicate::Within => {
-                                matches!(comparison, Relation::Equal | Relation::Within)
-                            }
-                            Predicate::Contains => {
-                                matches!(comparison, Relation::Equal | Relation::Contains)
-                            }
-                        })
-                    }
-                    (field @ (Field::Source | Field::Target), Operand::Selector(expected)) => {
-                        // A group can contain equivalent declarations with different spellings.
-                        let equal = link.occurrences.iter().any(|occurrence| match &field {
-                            Field::Source => {
-                                expected == &Target::Selector(occurrence.declaration.source.clone())
-                            }
-                            Field::Target => expected == &occurrence.declaration.reference.target,
-                            _ => unreachable!(),
-                        });
-                        equality(*relation, equal)
-                    }
-                    _ => bail!("invalid comparison; validate the expression before evaluation"),
+            } => match (Field::parse(field)?, value) {
+                (Field::Id, Operand::Json(expected)) => {
+                    let equal = expected.as_str() == Some(link.id.as_str());
+                    equality(*relation, equal)
                 }
-            }
+                (Field::Annotation(path), Operand::Json(expected)) => {
+                    equality(*relation, annotation(link, &path) == Some(expected))
+                }
+                (field @ (Field::Source | Field::Target), Operand::Region(target)) => {
+                    let selector = target.expand(&engine.session.workspace.config.names)?;
+                    let expected = engine.resolve(&selector).await?;
+                    let actual_selector = match field {
+                        Field::Source => link.source.clone(),
+                        _ => link
+                            .reference
+                            .target
+                            .expand(&engine.session.workspace.config.names)?,
+                    };
+                    let actual = engine.resolve(&actual_selector).await?;
+                    let comparison = engine.compare(&actual, &expected).await?;
+                    Ok(match relation {
+                        Predicate::Equal => comparison == Relation::Equal,
+                        Predicate::NotEqual => comparison != Relation::Equal,
+                        Predicate::Within => {
+                            matches!(comparison, Relation::Equal | Relation::Within)
+                        }
+                        Predicate::Contains => {
+                            matches!(comparison, Relation::Equal | Relation::Contains)
+                        }
+                    })
+                }
+                (field @ (Field::Source | Field::Target), Operand::RegionSelector(expected)) => {
+                    let mut expected = expected.expand(&engine.session.workspace.config.names)?;
+                    if let Some(resource) = &expected.resource {
+                        expected.resource =
+                            Some(engine.session.workspace.resource(resource).await?);
+                    }
+                    let expected = Target::RegionSelector(expected);
+                    let equal = match &field {
+                        Field::Source => expected == Target::RegionSelector(link.source.clone()),
+                        Field::Target => expected == link.reference.target,
+                        _ => unreachable!(),
+                    };
+                    equality(*relation, equal)
+                }
+                _ => bail!("invalid comparison; validate the expression before evaluation"),
+            },
         }
     }
 }
@@ -248,7 +252,7 @@ impl Field {
 }
 
 fn annotation<'a>(link: &'a Link, path: &[String]) -> Option<&'a Value> {
-    let mut value = &link.declaration().annotation;
+    let mut value = &link.annotation;
     for key in path {
         value = match value {
             Value::Object(object) => object.get(key)?,
@@ -355,7 +359,7 @@ impl Parser<'_> {
         let value = if self.take("region") {
             Operand::Region(self.target()?)
         } else if self.take("selector") {
-            Operand::Selector(self.target()?)
+            Operand::RegionSelector(self.target()?)
         } else {
             Operand::Json(self.json()?)
         };

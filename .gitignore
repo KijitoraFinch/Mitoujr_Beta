@@ -1,5 +1,6 @@
 AGENTS.md
 target/
 .monika/
+.monika-sidecar.lock
 *.swp
 *.swo

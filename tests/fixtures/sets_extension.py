@@ -71,7 +71,7 @@ def execute(operation, data, context):
         return {
             "name": NAME,
             "revision": "test-v1",
-            "operations": ["observe", "resolve", "compare", "extract", "check_plan", "check", "edit", "commit"],
+            "operations": ["observe", "resolve", "compare", "import", "check_plan", "check", "generate", "commit"],
             "domains": ["test.sets.v1"],
             "description": "Select rows from multiple observed JSON resources",
         }
@@ -94,7 +94,6 @@ def execute(operation, data, context):
         return {
             "domain": "test.sets.v1",
             "identity": sorted(selected),
-            "equivalence_key": hashlib.sha256(json.dumps(sorted(selected), separators=(",", ":")).encode()).hexdigest(),
             "content": {"count": len(selected)},
         }
     if operation == "compare":
@@ -109,44 +108,17 @@ def execute(operation, data, context):
         if left < right:
             return "within"
         return "incomparable"
-    if operation == "extract":
-        observation = data["observation"]
-        declarations = decode(pathlib.Path(data["content_path"]).read_bytes())["links"]
-        return {
-            "occurrences": [
-                {
-                    "declaration": declaration,
-                    "evidence": {
-                        "resource": observation["resource"],
-                        "observation": observation["id"],
-                        "extension": NAME,
-                        "location": {"index": index},
-                        "writable": True,
-                    },
-                }
-                for index, declaration in enumerate(declarations)
-            ],
-            "diagnostics": [],
-        }
-    if operation == "edit":
-        content = pathlib.Path(data["content_path"]).read_bytes()
-        document = decode(content) if data["observation"]["state"]["exists"] else {"links": []}
-        change = data["change"]
-        links = document["links"]
-        location = None
-        if change["op"] == "add":
-            location = {"index": len(links)}
-            links.append(change["declaration"])
-        elif change["op"] == "set":
-            location = change["location"]
-            links[location["index"]] = change["declaration"]
-        elif change["op"] == "remove":
-            del links[change["location"]["index"]]
-        else:
-            raise ValueError("unsupported edit")
-        if NAME == "tamper" and location is not None:
-            document["links"][location["index"]]["annotation"] = {"changed": True}
-        return {"bytes": list(encode(document)), "location": location}
+    if operation == "import":
+        links = decode(pathlib.Path(data["content_path"]).read_bytes())["links"]
+        return {"links": [{"link": link, "location": {"index": index}}
+                          for index, link in enumerate(links)],
+                "diagnostics": ([{"stage": "import", "subject": "fixture", "message": "incomplete input"}]
+                                if NAME == "partial" else [])}
+    if operation == "generate":
+        document = {"links": data["links"]}
+        if NAME == "tamper" and document["links"]:
+            document["links"][0]["annotation"] = {"changed": True}
+        return {"bytes": list(encode(document))}
     if operation == "commit":
         if NAME == "no_write":
             _, state = read_resource(data["resource"])
@@ -182,12 +154,12 @@ def execute(operation, data, context):
                 time.sleep(60)
             return {"content_hash": hashlib.sha256(content).hexdigest(), "state": state}
     if operation == "check_plan":
-        baseline = data["link"]["occurrences"][0]["declaration"]["annotation"]
+        baseline = data["link"]["annotation"]
         if isinstance(baseline, dict) and "baseline" in baseline:
             return [{"name": "baseline", **baseline["baseline"]}]
         return []
     if operation == "check":
-        annotation = data["link"]["occurrences"][0]["declaration"]["annotation"]
+        annotation = data["link"]["annotation"]
         if not isinstance(annotation, dict):
             return [{"status": "not_applicable", "code": "no_expectation", "message": "No count expectation"}]
         expected = annotation.get("expected_count")
@@ -195,7 +167,7 @@ def execute(operation, data, context):
             expected = data["regions"]["baseline"]["content"]["count"]
         if expected is None:
             return [{"status": "not_applicable", "code": "no_expectation", "message": "No count expectation"}]
-        actual = data["link"]["target"]["region"]["content"]["count"]
+        actual = data["target"]["region"]["content"]["count"]
         return [{"status": "pass" if actual == expected else "fail", "code": "count", "message": f"Expected {expected}, observed {actual}"}]
     raise ValueError("unsupported operation: " + operation)
 

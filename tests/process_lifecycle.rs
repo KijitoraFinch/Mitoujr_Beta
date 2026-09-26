@@ -294,7 +294,7 @@ ready.write_text(json.dumps([os.getpid(), helper.pid]))
 ready.replace('ready.json')
 time.sleep(60)
 "#;
-    let config = json!({"version":1,"sources":[],"extensions":{"slow": extension(script, 30000)}});
+    let config = json!({"version":1,"extensions":{"slow": extension(script, 30000)}});
     tokio::fs::write(dir.path().join("monika.json"), serde_json::to_vec(&config)?).await?;
     let child = cli(dir.path())
         .args(["extension", "show", "slow"])
@@ -352,29 +352,25 @@ async fn cancelling_a_request_invalidates_the_worker_without_restarting_it() -> 
 async fn interruption_after_commit_reports_uncertainty_and_does_not_repeat_the_write() -> Result<()>
 {
     let dir = tempfile::tempdir()?;
-    let config = json!({"version":1,"sources":[],"extensions":{"pause_after_commit":{
+    let config = json!({"version":1,"extensions":{"pause_after_commit":{
         "command":["python3", format!("{}/tests/fixtures/sets_extension.py", env!("CARGO_MANIFEST_DIR")), "pause_after_commit"],
         "revision":"test-v1","schemes":["file"]
     }}});
     tokio::fs::write(dir.path().join("monika.json"), serde_json::to_vec(&config)?).await?;
-    let declaration = json!({"id":"one","source":{"extension":"sets","resource":"rows.json","query":"0"},
-        "reference":{"target":{"extension":"sets","resource":"rows.json","query":"1"}},
+    let resource = url::Url::from_file_path(dir.path().canonicalize()?.join("rows.json"))
+        .unwrap()
+        .to_string();
+    let link = json!({"id":"one","source":{"extension":"sets","resource":resource,"query":"0"},
+        "reference":{"target":{"extension":"sets","resource":resource,"query":"1"}},
         "annotation":{"note":"saved before interruption"}});
-    let mut child = cli(dir.path())
-        .args([
-            "link",
-            "add",
-            "--in",
-            "new.links",
-            "--extension",
-            "pause_after_commit",
-            "--declaration",
-            "-",
-        ])
+    tokio::fs::write(
+        dir.path().join("monika.links.json"),
+        serde_json::to_vec(&json!({"version":1,"revision":1,"links":[link],"origins":[]}))?,
+    )
+    .await?;
+    let child = cli(dir.path())
+        .args(["generate", "new.links", "--extension", "pause_after_commit"])
         .spawn()?;
-    let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(&serde_json::to_vec(&declaration)?).await?;
-    drop(stdin);
     let marker = dir.path().join("commit-completed.json");
     timeout(Duration::from_secs(5), async {
         while !tokio::fs::try_exists(&marker).await? {
@@ -403,6 +399,6 @@ async fn interruption_after_commit_reports_uncertainty_and_does_not_repeat_the_w
     wait_until_gone(state["pid"].as_i64().unwrap() as libc::pid_t).await?;
     let saved: Value =
         serde_json::from_slice(&tokio::fs::read(dir.path().join("new.links")).await?)?;
-    assert_eq!(saved["links"], json!([declaration]));
+    assert_eq!(saved["links"], json!([link]));
     Ok(())
 }

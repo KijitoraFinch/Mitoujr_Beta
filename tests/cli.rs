@@ -7,6 +7,7 @@ use std::process::{Command, Stdio};
 
 fn run(root: &Path, args: &[&str], request: Option<&Value>) -> Result<(i32, Value)> {
     let mut child = Command::new(env!("CARGO_BIN_EXE_monika"))
+        .current_dir(root)
         .arg("--root")
         .arg(root)
         .arg("--json")
@@ -35,13 +36,13 @@ fn run(root: &Path, args: &[&str], request: Option<&Value>) -> Result<(i32, Valu
 
 fn setup() -> Result<tempfile::TempDir> {
     let dir = tempfile::tempdir()?;
+    assert_eq!(run(dir.path(), &["init"], None)?.0, 0);
     let config = json!({
         "version": 1,
         "extensions": {"sets": {
             "command": ["python3", format!("{}/tests/fixtures/sets_extension.py", env!("CARGO_MANIFEST_DIR"))],
             "revision": "test-v1", "schemes": ["file"]
         }},
-        "sources": [{"pattern": "*.links", "extension": "sets"}],
         "names": {"all": selector("rows.json", 0)},
         "checks": [{"extension": "sets"}]
     });
@@ -54,63 +55,43 @@ fn selector(file: &str, minimum: u32) -> Value {
     json!({"extension": "sets", "resource": file, "query": minimum.to_string()})
 }
 
-fn declaration(id: &str, minimum: u32, annotation: Value) -> Value {
+fn link(id: &str, minimum: u32, annotation: Value) -> Value {
     json!({"id": id, "source": selector("rows.json", 0), "reference": {"target": selector("rows.json", minimum)}, "annotation": annotation})
 }
 
-fn write_links(root: &Path, file: &str, declarations: Vec<Value>) -> Result<()> {
-    fs::write(
-        root.join(file),
-        serde_json::to_vec(&json!({"links": declarations}))?,
-    )?;
-    Ok(())
+fn add(root: &Path, link: &Value) -> Result<Value> {
+    let (code, result) = run(root, &["link", "add", "--link", "-"], Some(link))?;
+    assert_eq!(code, 0, "{result}");
+    Ok(result)
 }
 
-#[test]
-fn cli_groups_semantic_aliases_preserves_evidence_and_reports_conflicts() -> Result<()> {
-    let dir = setup()?;
-    let annotation = json!({"relation": "supports", "odd.key": [null, true]});
-    let first = declaration("shared", 2, annotation.clone());
-    let mut alias = first.clone();
-    alias["reference"]["target"] = json!({"extension":"sets","query":{
-        "resources":[url::Url::from_file_path(dir.path().canonicalize()?.join("rows.json")).unwrap().to_string()], "minimum":2
-    }});
-    write_links(
-        dir.path(),
-        "one.links",
-        vec![
-            first,
-            declaration("shared", 3, json!({"relation":"contradicts"})),
-        ],
-    )?;
-    write_links(dir.path(), "two.links", vec![alias])?;
-    let (code, result) = run(dir.path(), &["links"], None)?;
-    assert_eq!(code, 0, "{result}");
-    let links = result["data"]["links"].as_array().unwrap();
-    assert_eq!(links.len(), 2);
-    assert_eq!(links[0]["occurrences"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        links[0]["occurrences"][0]["declaration"]["annotation"],
-        annotation
-    );
-    assert_eq!(result["data"]["conflicts"][0]["id"], "shared");
-    assert_ne!(
-        links[0]["occurrences"][0]["evidence"]["resource"],
-        links[0]["source"]["selector"]["resource"]
-    );
-    let (code, checked) = run(dir.path(), &["check"], None)?;
-    assert_eq!(code, 1, "{checked}");
-    assert_eq!(checked["data"]["valid"], false);
+fn stored(root: &Path) -> Result<Value> {
+    Ok(serde_json::from_slice(&fs::read(
+        root.join("monika.links.json"),
+    )?)?)
+}
+
+fn configure_variant(root: &Path, name: &str) -> Result<()> {
+    let path = root.join("monika.json");
+    let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
+    let extension = json!({
+        "command": ["python3", format!("{}/tests/fixtures/sets_extension.py", env!("CARGO_MANIFEST_DIR")), name],
+        "revision": "test-v1", "schemes": ["file"]
+    });
+    config["extensions"] = json!({name: extension});
+    config["checks"] = json!([]);
+    fs::write(path, serde_json::to_vec(&config)?)?;
     Ok(())
 }
 
 #[test]
 fn conditions_preserve_unknown_matches_and_boolean_dominance() -> Result<()> {
     let dir = setup()?;
-    let good = declaration("good", 2, json!({"relation":"supports", "odd.key":[null]}));
-    let mut missing = declaration("missing", 0, json!({"relation":"broken"}));
+    let good = link("good", 2, json!({"relation":"supports", "odd.key":[null]}));
+    let mut missing = link("missing", 0, json!({"relation":"broken"}));
     missing["reference"]["target"] = selector("missing.json", 0);
-    write_links(dir.path(), "links.links", vec![good, missing])?;
+    add(dir.path(), &good)?;
+    add(dir.path(), &missing)?;
     let (code, result) = run(
         dir.path(),
         &["links", "--where", r#"target within region("@all")"#],
@@ -218,14 +199,14 @@ fn cli_and_json_requests_share_operations_and_snapshots_survive_live_changes() -
 fn annotation_checker_uses_saved_baseline_and_reports_changed_content() -> Result<()> {
     let dir = setup()?;
     let (_, shown) = run(dir.path(), &["show", "sets:rows.json#2"], None)?;
-    let declaration = declaration(
+    let declaration = link(
         "baseline",
         2,
         json!({"baseline":{
             "snapshot":shown["snapshot"],"target":selector("rows.json",2)
         }}),
     );
-    write_links(dir.path(), "links.links", vec![declaration])?;
+    add(dir.path(), &declaration)?;
     let (code, checked) = run(dir.path(), &["check"], None)?;
     assert_eq!(code, 0, "{checked}");
     fs::write(dir.path().join("rows.json"), "[1,2,3,4]")?;
@@ -234,370 +215,6 @@ fn annotation_checker_uses_saved_baseline_and_reports_changed_content() -> Resul
     assert_eq!(
         checked["data"]["findings"][1]["findings"][0]["status"],
         "fail"
-    );
-    Ok(())
-}
-
-#[test]
-fn complete_empty_and_failed_extraction_have_distinct_statuses() -> Result<()> {
-    let dir = setup()?;
-    let (code, empty) = run(dir.path(), &["links"], None)?;
-    assert_eq!(code, 0, "{empty}");
-    assert_eq!(empty["complete"], true);
-    fs::write(dir.path().join("broken.links"), "not json")?;
-    let (code, broken) = run(dir.path(), &["links"], None)?;
-    assert_eq!(code, 2, "{broken}");
-    assert_eq!(broken["complete"], false);
-    assert_eq!(broken["data"]["diagnostics"].as_array().unwrap().len(), 1);
-    let (code, malformed) = run(dir.path(), &["links", "--where", "source == 3"], None)?;
-    assert_eq!(code, 2, "{malformed}");
-    assert_eq!(malformed["ok"], false);
-    Ok(())
-}
-
-#[test]
-fn sidecar_annotations_are_added_replaced_and_removed_in_the_original_resource() -> Result<()> {
-    let dir = setup()?;
-    let initial = declaration(
-        "editable",
-        2,
-        json!({"review":{"owner":"利用者","labels":[1,null,true]}}),
-    );
-    let (code, added) = run(
-        dir.path(),
-        &[
-            "link",
-            "add",
-            "--in",
-            "new.links",
-            "--extension",
-            "sets",
-            "--declaration",
-            "-",
-        ],
-        Some(&initial),
-    )?;
-    assert_eq!(code, 0, "{added}");
-    let saved: Value = serde_json::from_slice(&fs::read(dir.path().join("new.links"))?)?;
-    assert_eq!(saved["links"][0], initial);
-    let updated = declaration("editable", 3, json!([{"自由な項目":"値"}, false, null]));
-    let (code, changed) = run(
-        dir.path(),
-        &[
-            "link",
-            "set",
-            "--in",
-            "new.links",
-            "--extension",
-            "sets",
-            "--id",
-            "editable",
-            "--declaration",
-            "-",
-        ],
-        Some(&updated),
-    )?;
-    assert_eq!(code, 0, "{changed}");
-    let saved: Value = serde_json::from_slice(&fs::read(dir.path().join("new.links"))?)?;
-    assert_eq!(saved["links"][0], updated);
-    let (code, removed) = run(
-        dir.path(),
-        &[
-            "link",
-            "remove",
-            "--in",
-            "new.links",
-            "--extension",
-            "sets",
-            "--id",
-            "editable",
-        ],
-        None,
-    )?;
-    assert_eq!(code, 0, "{removed}");
-    let saved: Value = serde_json::from_slice(&fs::read(dir.path().join("new.links"))?)?;
-    assert_eq!(saved["links"], json!([]));
-    Ok(())
-}
-
-#[test]
-fn saved_patches_are_reviewable_and_reject_stale_or_tampered_content() -> Result<()> {
-    let dir = setup()?;
-    let original = declaration("old", 1, json!({"preserve":true}));
-    write_links(dir.path(), "existing.links", vec![original.clone()])?;
-    let to_add = declaration("new", 2, Value::Null);
-    let (code, prepared) = run(
-        dir.path(),
-        &[
-            "link",
-            "add",
-            "--in",
-            "existing.links",
-            "--extension",
-            "sets",
-            "--declaration",
-            "-",
-            "--patch-out",
-            "change.patch.json",
-        ],
-        Some(&to_add),
-    )?;
-    assert_eq!(code, 0, "{prepared}");
-    assert_eq!(prepared["data"]["applied"], false);
-    let saved: Value = serde_json::from_slice(&fs::read(dir.path().join("existing.links"))?)?;
-    assert_eq!(saved["links"], json!([original]));
-    let patch = dir.path().join("change.patch.json");
-    let (code, applied) = run(dir.path(), &["apply", patch.to_str().unwrap()], None)?;
-    assert_eq!(code, 0, "{applied}");
-    let after_apply = fs::read(dir.path().join("existing.links"))?;
-    let (code, stale) = run(dir.path(), &["apply", patch.to_str().unwrap()], None)?;
-    assert_eq!(code, 2, "{stale}");
-    assert!(
-        stale["error"]
-            .as_str()
-            .unwrap()
-            .contains("resource changed")
-    );
-    assert_eq!(fs::read(dir.path().join("existing.links"))?, after_apply);
-    let mut tampered: Value = serde_json::from_slice(&fs::read(&patch)?)?;
-    tampered["replacement"]["text"] = json!("tampered");
-    let (code, rejected) = run(
-        dir.path(),
-        &["request"],
-        Some(&json!({"op":"apply","patch":tampered})),
-    )?;
-    assert_eq!(code, 2, "{rejected}");
-    assert!(rejected["error"].as_str().unwrap().contains("integrity"));
-    assert_eq!(fs::read(dir.path().join("existing.links"))?, after_apply);
-    Ok(())
-}
-
-#[test]
-fn copying_between_external_formats_preserves_target_and_annotation() -> Result<()> {
-    let dir = setup()?;
-    let path = dir.path().join("monika.json");
-    let mut config: Value = serde_json::from_slice(&fs::read(&path)?)?;
-    let mut lines = config["extensions"]["sets"].clone();
-    lines["command"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!("lines"));
-    lines["schemes"] = json!([]);
-    config["extensions"]["lines"] = lines;
-    config["comparators"] = json!({"test.sets.v1":"sets"});
-    fs::write(&path, serde_json::to_vec(&config)?)?;
-    let original = declaration("copied", 2, json!({"note":["a",{"nested":null}]}));
-    write_links(dir.path(), "source.links", vec![original.clone()])?;
-    let (code, result) = run(
-        dir.path(),
-        &[
-            "link",
-            "copy",
-            "--from",
-            "source.links",
-            "--from-extension",
-            "sets",
-            "--id",
-            "copied",
-            "--in",
-            "destination.jsonl",
-            "--extension",
-            "lines",
-        ],
-        None,
-    )?;
-    assert_eq!(code, 0, "{result}");
-    let copied: Value = serde_json::from_slice(&fs::read(dir.path().join("destination.jsonl"))?)?;
-    assert_eq!(copied, original);
-    let source: Value = serde_json::from_slice(&fs::read(dir.path().join("source.links"))?)?;
-    assert_eq!(source["links"][0], original);
-    Ok(())
-}
-
-#[test]
-fn new_resource_patch_rejects_intervening_creation_and_existing_path_replacement() -> Result<()> {
-    let dir = setup()?;
-    let declaration = declaration("one", 2, Value::Null);
-    let (code, prepared) = run(
-        dir.path(),
-        &[
-            "link",
-            "add",
-            "--in",
-            "new.links",
-            "--extension",
-            "sets",
-            "--declaration",
-            "-",
-            "--patch-out",
-            "new.patch",
-        ],
-        Some(&declaration),
-    )?;
-    assert_eq!(code, 0, "{prepared}");
-    fs::write(dir.path().join("new.links"), "user content")?;
-    let (code, rejected) = run(
-        dir.path(),
-        &["apply", dir.path().join("new.patch").to_str().unwrap()],
-        None,
-    )?;
-    assert_eq!(code, 2, "{rejected}");
-    assert_eq!(
-        fs::read_to_string(dir.path().join("new.links"))?,
-        "user content"
-    );
-
-    write_links(dir.path(), "original.links", vec![declaration.clone()])?;
-    let (code, prepared) = run(
-        dir.path(),
-        &[
-            "link",
-            "remove",
-            "--in",
-            "original.links",
-            "--extension",
-            "sets",
-            "--id",
-            "one",
-            "--patch-out",
-            "remove.patch",
-        ],
-        None,
-    )?;
-    assert_eq!(code, 0, "{prepared}");
-    let original = fs::read(dir.path().join("original.links"))?;
-    fs::write(dir.path().join("replacement"), &original)?;
-    fs::rename(
-        dir.path().join("replacement"),
-        dir.path().join("original.links"),
-    )?;
-    let (code, rejected) = run(
-        dir.path(),
-        &["apply", dir.path().join("remove.patch").to_str().unwrap()],
-        None,
-    )?;
-    assert_eq!(code, 2, "{rejected}");
-    assert_eq!(fs::read(dir.path().join("original.links"))?, original);
-    Ok(())
-}
-
-#[test]
-fn cli_usage_errors_are_json_and_initialization_has_no_implicit_formats() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let (code, initialized) = run(dir.path(), &["init"], None)?;
-    assert_eq!(code, 0, "{initialized}");
-    let (code, duplicate) = run(dir.path(), &["init"], None)?;
-    assert_eq!(code, 2, "{duplicate}");
-    let (code, listed) = run(dir.path(), &["extension", "list"], None)?;
-    assert_eq!(code, 0, "{listed}");
-    assert_eq!(listed["data"], json!([]));
-    let (code, invalid) = run(dir.path(), &["unknown-command"], None)?;
-    assert_eq!(code, 2, "{invalid}");
-    assert_eq!(invalid["ok"], false);
-    let (code, invalid) = run(dir.path(), &["links", "--within"], None)?;
-    assert_eq!(code, 2, "{invalid}");
-    Ok(())
-}
-
-#[cfg(unix)]
-#[test]
-fn sidecar_paths_resolve_symlink_parents_before_editing_or_creating() -> Result<()> {
-    let dir = setup()?;
-    fs::create_dir_all(dir.path().join("real/inner"))?;
-    std::os::unix::fs::symlink("real/inner", dir.path().join("shortcut"))?;
-    let original = declaration("victim", 2, json!({"note": "keep"}));
-    write_links(dir.path(), "victim.links", vec![original.clone()])?;
-    write_links(dir.path(), "real/victim.links", vec![original.clone()])?;
-    let untouched = fs::read(dir.path().join("victim.links"))?;
-
-    let (code, result) = run(
-        dir.path(),
-        &[
-            "link",
-            "remove",
-            "--in",
-            "shortcut/../victim.links",
-            "--extension",
-            "sets",
-            "--id",
-            "victim",
-        ],
-        None,
-    )?;
-    assert_eq!(code, 0, "{result}");
-    assert_eq!(fs::read(dir.path().join("victim.links"))?, untouched);
-    let updated: Value = serde_json::from_slice(&fs::read(dir.path().join("real/victim.links"))?)?;
-    assert_eq!(updated["links"], json!([]));
-
-    let (code, result) = run(
-        dir.path(),
-        &[
-            "link",
-            "add",
-            "--in",
-            "shortcut/../新規 #100%.links",
-            "--extension",
-            "sets",
-            "--declaration",
-            "-",
-        ],
-        Some(&original),
-    )?;
-    assert_eq!(code, 0, "{result}");
-    assert!(!dir.path().join("新規 #100%.links").exists());
-    let created: Value =
-        serde_json::from_slice(&fs::read(dir.path().join("real/新規 #100%.links"))?)?;
-    assert_eq!(created["links"], json!([original]));
-    Ok(())
-}
-
-#[test]
-fn source_scan_preserves_filenames_and_replays_after_directory_deletion() -> Result<()> {
-    let dir = setup()?;
-    let mut config: Value = serde_json::from_slice(&fs::read(dir.path().join("monika.json"))?)?;
-    config["sources"][0]["pattern"] = json!("**/*.links");
-    fs::write(dir.path().join("monika.json"), serde_json::to_vec(&config)?)?;
-    let folder = dir.path().join("資料");
-    fs::create_dir(&folder)?;
-    let path = folder.join("注釈 #100%.links");
-    fs::write(
-        &path,
-        serde_json::to_vec(&json!({"links": [declaration("one", 0, Value::Null)]}))?,
-    )?;
-
-    let (code, result) = run(dir.path(), &["links"], None)?;
-    assert_eq!(code, 0, "{result}");
-    assert_eq!(result["complete"], true);
-    assert_eq!(result["data"]["links"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        result["data"]["links"][0]["occurrences"][0]["evidence"]["resource"],
-        url::Url::from_file_path(path.canonicalize()?)
-            .unwrap()
-            .as_str()
-    );
-    fs::remove_dir_all(&folder)?;
-    let (code, replay) = run(
-        dir.path(),
-        &["--snapshot", result["snapshot"].as_str().unwrap(), "links"],
-        None,
-    )?;
-    assert_eq!(code, 0, "{replay}");
-    assert_eq!(replay["data"]["links"], result["data"]["links"]);
-    Ok(())
-}
-
-#[test]
-fn documented_walkthrough_executes_every_command_with_real_files() -> Result<()> {
-    let output = Command::new("python3")
-        .arg(format!("{}/examples/demo.py", env!("CARGO_MANIFEST_DIR")))
-        .arg("--monika")
-        .arg(env!("CARGO_BIN_EXE_monika"))
-        .output()?;
-    assert!(
-        output.status.success(),
-        "stdout={}\nstderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
     );
     Ok(())
 }
@@ -635,127 +252,643 @@ fn extension_testing_distinguishes_law_violations_from_failed_resolution() -> Re
 }
 
 #[test]
-fn core_rejects_annotation_loss_and_does_not_accept_an_unperformed_write() -> Result<()> {
-    let dir = setup()?;
-    let config_path = dir.path().join("monika.json");
-    let mut config: Value = serde_json::from_slice(&fs::read(&config_path)?)?;
-    let mut tamper = config["extensions"]["sets"].clone();
-    tamper["command"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!("tamper"));
-    tamper["schemes"] = json!([]);
-    config["extensions"]["tamper"] = tamper;
-    fs::write(&config_path, serde_json::to_vec(&config)?)?;
-    let declaration = declaration("preserve", 2, json!({"keep":[1,null,{"日本語":true}]}));
-    let (code, rejected) = run(
-        dir.path(),
-        &[
-            "link",
-            "add",
-            "--in",
-            "new.links",
-            "--extension",
-            "tamper",
-            "--declaration",
-            "-",
-        ],
-        Some(&declaration),
-    )?;
-    assert_eq!(code, 2, "{rejected}");
-    assert!(!dir.path().join("new.links").exists());
+fn core_owns_links_without_extensions_and_cache_deletion_preserves_authority() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (code, init) = run(dir.path(), &["init"], None)?;
+    assert_eq!(code, 0, "{init}");
+    assert!(dir.path().join("monika.links.json").exists());
+    let original = link(
+        "first",
+        2,
+        json!({"日本語":[null, true, {"value":123456789012345678901234567890_u128}]}),
+    );
+    add(dir.path(), &original)?;
+    let data = stored(dir.path())?;
+    assert_eq!(data["links"][0]["annotation"], original["annotation"]);
     assert!(
-        rejected["error"]
+        data["links"][0]["source"]["resource"]
             .as_str()
             .unwrap()
-            .contains("editor changed")
+            .starts_with("file:")
     );
+    let (code, listed) = run(dir.path(), &["links"], None)?;
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(listed["data"]["links"], data["links"]);
+    fs::remove_dir_all(dir.path().join(".monika"))?;
+    let (code, rebuilt) = run(dir.path(), &["links"], None)?;
+    assert_eq!(code, 0, "{rebuilt}");
+    assert_eq!(rebuilt["data"]["links"], data["links"]);
+    let mut replacement = original.clone();
+    replacement["annotation"] = json!([false, {"nested": "preserved"}]);
+    let (code, changed) = run(
+        dir.path(),
+        &["link", "set", "--link", "-"],
+        Some(&replacement),
+    )?;
+    assert_eq!(code, 0, "{changed}");
+    assert_eq!(
+        stored(dir.path())?["links"][0]["annotation"],
+        replacement["annotation"]
+    );
+    let (code, removed) = run(dir.path(), &["link", "remove", "first"], None)?;
+    assert_eq!(code, 0, "{removed}");
+    assert_eq!(stored(dir.path())?["links"], json!([]));
+    Ok(())
+}
 
-    let mut no_write = config["extensions"]["sets"].clone();
-    no_write["command"]
-        .as_array_mut()
-        .unwrap()
-        .push(json!("no_write"));
-    config["extensions"]["sets"]["schemes"] = json!([]);
-    config["extensions"]["no_write"] = no_write;
-    fs::write(&config_path, serde_json::to_vec(&config)?)?;
-    write_links(dir.path(), "existing.links", vec![])?;
-    let original = fs::read(dir.path().join("existing.links"))?;
-    let (code, rejected) = run(
+#[test]
+fn normalization_rejects_duplicate_ids_definitions_and_unknown_named_targets() -> Result<()> {
+    let dir = setup()?;
+    let mut named = link("one", 0, json!({"n":1}));
+    named["reference"]["target"] = json!({"name":"all"});
+    add(dir.path(), &named)?;
+    let original = stored(dir.path())?;
+    for candidate in [
+        link("one", 3, json!(null)),
+        link("other", 0, json!({"n":1})),
+    ] {
+        let (code, error) = run(
+            dir.path(),
+            &["link", "add", "--link", "-"],
+            Some(&candidate),
+        )?;
+        assert_eq!(code, 2, "{error}");
+        assert_eq!(stored(dir.path())?, original);
+    }
+    named["id"] = json!("unknown");
+    named["reference"]["target"] = json!({"name":"unknown"});
+    assert_eq!(
+        run(dir.path(), &["link", "add", "--link", "-"], Some(&named))?.0,
+        2
+    );
+    assert!(
+        original["links"][0]["reference"]["target"]
+            .get("name")
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn sidecar_snapshots_ignore_later_edits_and_unrelated_external_files() -> Result<()> {
+    let dir = setup()?;
+    add(dir.path(), &link("one", 0, json!("original")))?;
+    fs::write(dir.path().join("unrelated.links"), "this is not JSON")?;
+    let (code, before) = run(dir.path(), &["links"], None)?;
+    assert_eq!(code, 0, "{before}");
+    let snapshot = before["snapshot"].as_str().unwrap();
+    run(dir.path(), &["link", "remove", "one"], None)?;
+    let (code, replay) = run(dir.path(), &["--snapshot", snapshot, "links"], None)?;
+    assert_eq!(code, 0, "{replay}");
+    assert_eq!(before["data"], replay["data"]);
+    fs::write(dir.path().join("monika.links.json"), "corrupted")?;
+    assert_eq!(run(dir.path(), &["links"], None)?.0, 2);
+    assert_eq!(
+        run(dir.path(), &["--snapshot", snapshot, "links"], None)?.0,
+        0
+    );
+    Ok(())
+}
+
+#[test]
+fn saved_sidecar_patches_reject_stale_tampered_and_concurrent_state() -> Result<()> {
+    let dir = setup()?;
+    add(dir.path(), &link("one", 0, json!(null)))?;
+    let patch_path = dir.path().join("change.json");
+    let (code, prepared) = run(
         dir.path(),
         &[
             "link",
-            "add",
-            "--in",
-            "existing.links",
+            "remove",
+            "one",
+            "--patch-out",
+            patch_path.to_str().unwrap(),
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "{prepared}");
+    let original_patch = fs::read(&patch_path)?;
+    let mut tampered: Value = serde_json::from_slice(&original_patch)?;
+    tampered["change"]["after"]["revision"] = json!(999);
+    fs::write(&patch_path, serde_json::to_vec(&tampered)?)?;
+    assert_eq!(
+        run(dir.path(), &["apply", patch_path.to_str().unwrap()], None)?.0,
+        2
+    );
+    fs::write(&patch_path, original_patch)?;
+    add(dir.path(), &link("two", 2, json!(null)))?;
+    let before = stored(dir.path())?;
+    let (code, stale) = run(dir.path(), &["apply", patch_path.to_str().unwrap()], None)?;
+    assert_eq!(code, 2, "{stale}");
+    assert!(stale["error"].as_str().unwrap().contains("Sidecar changed"));
+    assert_eq!(before, stored(dir.path())?);
+    let lock = fs::File::options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(dir.path().join(".monika-sidecar.lock"))?;
+    lock.lock()?;
+    let (code, locked) = run(dir.path(), &["link", "remove", "one"], None)?;
+    assert_eq!(code, 2, "{locked}");
+    assert_eq!(before, stored(dir.path())?);
+    drop(lock);
+    assert_eq!(run(dir.path(), &["link", "remove", "one"], None)?.0, 0);
+    Ok(())
+}
+
+#[test]
+fn import_is_explicit_atomic_idempotent_and_retains_observation_provenance() -> Result<()> {
+    let dir = setup()?;
+    let original = link("imported", 2, json!({"kind":"from-external"}));
+    fs::write(
+        dir.path().join("input.links"),
+        serde_json::to_vec(&json!({"links":[original]}))?,
+    )?;
+    assert_eq!(
+        run(dir.path(), &["links"], None)?.1["data"]["links"],
+        json!([])
+    );
+    let (code, imported) = run(
+        dir.path(),
+        &["import", "input.links", "--extension", "sets"],
+        None,
+    )?;
+    assert_eq!(code, 0, "{imported}");
+    let before = stored(dir.path())?;
+    assert_eq!(before["origins"].as_array().unwrap().len(), 1);
+    assert_eq!(before["origins"][0]["location"], json!({"index":0}));
+    let observation =
+        &before["observations"][before["origins"][0]["observation"].as_str().unwrap()];
+    assert_eq!(
+        fs::read(
+            dir.path()
+                .join(".monika/blobs")
+                .join(observation["content_hash"].as_str().unwrap())
+        )?,
+        fs::read(dir.path().join("input.links"))?
+    );
+    assert_eq!(
+        run(
+            dir.path(),
+            &["import", "input.links", "--extension", "sets"],
+            None
+        )?
+        .0,
+        0
+    );
+    assert_eq!(stored(dir.path())?, before);
+    let mut conflicting = original;
+    conflicting["annotation"] = json!("changed");
+    fs::write(
+        dir.path().join("input.links"),
+        serde_json::to_vec(&json!({"links":[link("new",3,json!(null)), conflicting]}))?,
+    )?;
+    let (code, conflict) = run(
+        dir.path(),
+        &["import", "input.links", "--extension", "sets"],
+        None,
+    )?;
+    assert_eq!(code, 2, "{conflict}");
+    assert_eq!(
+        stored(dir.path())?,
+        before,
+        "an import must not partly register candidates"
+    );
+    fs::remove_file(dir.path().join("input.links"))?;
+    assert_eq!(
+        run(dir.path(), &["links"], None)?.1["data"]["links"],
+        before["links"]
+    );
+    Ok(())
+}
+
+#[test]
+fn semantic_duplicates_are_checked_without_merging_link_identity() -> Result<()> {
+    let dir = setup()?;
+    let first = link("first", 2, json!({"kind":"same"}));
+    let mut second = first.clone();
+    second["id"] = json!("second");
+    second["reference"]["target"] = json!({"extension":"sets","query":{"resources":[url::Url::from_file_path(dir.path().canonicalize()?.join("rows.json")).unwrap().to_string()],"minimum":2}});
+    add(dir.path(), &first)?;
+    add(dir.path(), &second)?;
+    let (code, listed) = run(dir.path(), &["links", "--where", "id == \"first\""], None)?;
+    assert_eq!(code, 0, "{listed}");
+    assert_eq!(listed["data"]["links"].as_array().unwrap().len(), 1);
+    let (code, checked) = run(
+        dir.path(),
+        &["check", "--duplicates", "--where", "id == \"first\""],
+        None,
+    )?;
+    assert_eq!(code, 1, "{checked}");
+    assert_eq!(checked["data"]["duplicates"], json!([["first", "second"]]));
+    assert_eq!(stored(dir.path())?["links"].as_array().unwrap().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn generate_preserves_selected_links_and_does_not_update_the_sidecar() -> Result<()> {
+    let dir = setup()?;
+    add(
+        dir.path(),
+        &link("one", 1, json!({"nested":[null, {"日本語":false}]})),
+    )?;
+    add(dir.path(), &link("two", 2, json!([1, 2, 3])))?;
+    let authority = stored(dir.path())?;
+    let (code, generated) = run(
+        dir.path(),
+        &[
+            "generate",
+            "output.links",
             "--extension",
             "sets",
-            "--declaration",
-            "-",
+            "--where",
+            "id == \"one\"",
         ],
-        Some(&declaration),
+        None,
     )?;
-    assert_eq!(code, 2, "{rejected}");
+    assert_eq!(code, 0, "{generated}");
+    let output: Value = serde_json::from_slice(&fs::read(dir.path().join("output.links"))?)?;
+    assert_eq!(output["links"], json!([authority["links"][0]]));
+    assert_eq!(stored(dir.path())?, authority);
+    configure_variant(dir.path(), "lines")?;
+    let (code, generated) = run(
+        dir.path(),
+        &["generate", "output.jsonl", "--extension", "lines"],
+        None,
+    )?;
+    assert_eq!(code, 0, "{generated}");
+    let output: Vec<Value> = fs::read_to_string(dir.path().join("output.jsonl"))?
+        .lines()
+        .map(serde_json::from_str)
+        .collect::<std::result::Result<_, _>>()?;
+    assert_eq!(json!(output), authority["links"]);
+    Ok(())
+}
+
+#[test]
+fn generation_rejects_annotation_loss_false_commits_and_intervening_creation() -> Result<()> {
+    let dir = setup()?;
+    add(dir.path(), &link("one", 2, json!({"keep":true})))?;
+    configure_variant(dir.path(), "tamper")?;
+    let (code, lost) = run(
+        dir.path(),
+        &["generate", "bad.links", "--extension", "tamper"],
+        None,
+    )?;
+    assert_eq!(code, 2, "{lost}");
     assert!(
-        rejected["error"]
+        lost["error"]
             .as_str()
             .unwrap()
-            .contains("does not match")
+            .contains("generator changed")
     );
-    assert_eq!(fs::read(dir.path().join("existing.links"))?, original);
+    assert!(!dir.path().join("bad.links").exists());
+    configure_variant(dir.path(), "no_write")?;
+    fs::write(dir.path().join("bad.links"), r#"{"links":[]}"#)?;
+    let (code, unconfirmed) = run(
+        dir.path(),
+        &["generate", "bad.links", "--extension", "no_write"],
+        None,
+    )?;
+    assert_eq!(code, 2, "{unconfirmed}");
+    assert!(
+        unconfirmed["error"]
+            .as_str()
+            .unwrap()
+            .contains("does not match committed patch"),
+        "{unconfirmed}"
+    );
+    configure_variant(dir.path(), "sets")?;
+    assert_eq!(
+        run(
+            dir.path(),
+            &[
+                "generate",
+                "new.links",
+                "--extension",
+                "sets",
+                "--patch-out",
+                "proposal.json"
+            ],
+            None
+        )?
+        .0,
+        0
+    );
+    fs::write(dir.path().join("new.links"), "intervening content")?;
+    let (code, stale) = run(dir.path(), &["apply", "proposal.json"], None)?;
+    assert_eq!(code, 2, "{stale}");
+    assert!(
+        stale["error"]
+            .as_str()
+            .unwrap()
+            .contains("Resource changed")
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("new.links"))?,
+        "intervening content"
+    );
+    assert_eq!(
+        run(
+            dir.path(),
+            &["generate", "monika.links.json", "--extension", "sets"],
+            None
+        )?
+        .0,
+        2
+    );
+    Ok(())
+}
+
+#[test]
+fn missing_resources_are_unknown_checks_and_do_not_hide_stored_links() -> Result<()> {
+    let dir = setup()?;
+    let mut missing = link("missing", 0, json!(null));
+    missing["reference"]["target"] = selector("missing.json", 0);
+    add(dir.path(), &missing)?;
+    assert_eq!(run(dir.path(), &["links"], None)?.0, 0);
+    let (code, checked) = run(dir.path(), &["check"], None)?;
+    assert_eq!(code, 2, "{checked}");
+    assert_eq!(checked["complete"], false);
+    assert_eq!(
+        checked["data"]["selection"]["diagnostics"][0]["stage"],
+        "resolve"
+    );
+    Ok(())
+}
+
+#[test]
+fn removed_configuration_and_cli_forms_are_rejected() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (code, bad) = run(dir.path(), &["link", "copy"], None)?;
+    assert_eq!(code, 2, "{bad}");
+    fs::write(
+        dir.path().join("monika.json"),
+        r#"{"version":1,"sources":[]}"#,
+    )?;
+    let (code, bad) = run(dir.path(), &["links"], None)?;
+    assert_eq!(code, 2, "{bad}");
+    assert!(bad["error"].as_str().unwrap().contains("unknown field"));
+    Ok(())
+}
+
+#[test]
+fn missing_authority_and_broken_origin_references_do_not_become_empty_results() -> Result<()> {
+    let dir = setup()?;
+    fs::remove_file(dir.path().join("monika.links.json"))?;
+    let (code, missing) = run(dir.path(), &["links"], None)?;
+    assert_eq!(code, 2, "{missing}");
+    let (code, added) = run(
+        dir.path(),
+        &["link", "add", "--link", "-"],
+        Some(&link("one", 0, json!(null))),
+    )?;
+    assert_eq!(code, 2, "{added}");
+    assert!(!dir.path().join("monika.links.json").exists());
+    fs::write(
+        dir.path().join("monika.links.json"),
+        serde_json::to_vec(&json!({
+            "version":1,"revision":1,"links":[],"origins":[{"link":"absent","observation":"absent","extension":"sets","revision":"test-v1","location":0}]
+        }))?,
+    )?;
+    let (code, broken) = run(dir.path(), &["links"], None)?;
+    assert_eq!(code, 2, "{broken}");
+    assert!(
+        broken["error"]
+            .as_str()
+            .unwrap()
+            .contains("missing Observation")
+    );
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
-fn interrupt_stops_a_waiting_cli_and_its_extension() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let config = json!({"version":1,"sources":[],"extensions":{"slow":{
-        "command":["python3","-c","import os,pathlib,time; pid=pathlib.Path('worker.pid.tmp'); pid.write_text(str(os.getpid())); pid.replace('worker.pid'); time.sleep(60)"],
-        "revision":"1","timeout_ms":30000
-    }}});
-    fs::write(dir.path().join("monika.json"), serde_json::to_vec(&config)?)?;
-    let mut child = Command::new(env!("CARGO_BIN_EXE_monika"))
-        .arg("--root")
-        .arg(dir.path())
-        .args(["--json", "extension", "show", "slow"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while !dir.path().join("worker.pid").exists() {
-        if std::time::Instant::now() > deadline {
-            child.kill()?;
-            panic!("worker did not start");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let worker: libc::pid_t = fs::read_to_string(dir.path().join("worker.pid"))?.parse()?;
-    // SAFETY: signal only the live CLI process created by this test.
+fn generation_paths_use_os_parent_resolution_and_detect_destination_replacement() -> Result<()> {
+    use std::os::unix::fs::symlink;
+    let dir = setup()?;
+    add(dir.path(), &link("one", 2, json!(null)))?;
+    fs::create_dir_all(dir.path().join("real/child"))?;
+    symlink("real/child", dir.path().join("shortcut"))?;
+    let (code, generated) = run(
+        dir.path(),
+        &[
+            "generate",
+            "shortcut/../日本語 #%.links",
+            "--extension",
+            "sets",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "{generated}");
+    assert!(dir.path().join("real/日本語 #%.links").exists());
+    assert!(!dir.path().join("日本語 #%.links").exists());
+    let (code, prepared) = run(
+        dir.path(),
+        &[
+            "generate",
+            "real/日本語 #%.links",
+            "--extension",
+            "sets",
+            "--patch-out",
+            "replacement.json",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "{prepared}");
+    let destination = dir.path().join("real/日本語 #%.links");
+    let saved = fs::read(&destination)?;
+    fs::write(dir.path().join("substitute"), &saved)?;
+    fs::rename(dir.path().join("substitute"), &destination)?;
+    let (code, changed) = run(dir.path(), &["apply", "replacement.json"], None)?;
+    assert_eq!(code, 2, "{changed}");
+    assert!(
+        changed["error"]
+            .as_str()
+            .unwrap()
+            .contains("Resource changed")
+    );
+    assert_eq!(fs::read(&destination)?, saved);
+    Ok(())
+}
+
+#[test]
+fn executable_documentation_covers_all_commands() -> Result<()> {
+    let output = Command::new("python3")
+        .arg(format!("{}/examples/demo.py", env!("CARGO_MANIFEST_DIR")))
+        .args(["--monika", env!("CARGO_BIN_EXE_monika")])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    Ok(())
+}
+
+#[test]
+fn imported_links_share_observation_metadata_and_deletion_removes_only_unused_origins() -> Result<()>
+{
+    let dir = setup()?;
+    fs::write(
+        dir.path().join("input.links"),
+        serde_json::to_vec(&json!({"links":[
+            link("one",1,json!(null)), link("two",2,json!(null))
+        ]}))?,
+    )?;
     assert_eq!(
-        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+        run(
+            dir.path(),
+            &["import", "input.links", "--extension", "sets"],
+            None
+        )?
+        .0,
         0
     );
-    while child.try_wait()?.is_none() {
-        if std::time::Instant::now() > deadline {
-            child.kill()?;
-            // SAFETY: this is the dedicated extension process group recorded above.
-            unsafe {
-                libc::kill(-worker, libc::SIGKILL);
-            }
-            panic!("CLI did not respond to interruption");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-    let output = child.wait_with_output()?;
-    assert_eq!(output.status.code(), Some(130));
-    let response: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(response["ok"], false);
-    // SAFETY: signal zero only probes the terminated child's process ID.
-    assert_eq!(unsafe { libc::kill(worker, 0) }, -1);
+    let before = stored(dir.path())?;
+    assert_eq!(before["origins"].as_array().unwrap().len(), 2);
+    assert_eq!(before["observations"].as_object().unwrap().len(), 1);
     assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ESRCH)
+        run(
+            dir.path(),
+            &["import", "input.links", "--extension", "sets"],
+            None
+        )?
+        .0,
+        0
     );
+    assert_eq!(stored(dir.path())?, before);
+    assert_eq!(run(dir.path(), &["link", "remove", "one"], None)?.0, 0);
+    let one_left = stored(dir.path())?;
+    assert_eq!(one_left["origins"].as_array().unwrap().len(), 1);
+    assert_eq!(one_left["observations"], before["observations"]);
+    assert_eq!(run(dir.path(), &["link", "remove", "two"], None)?.0, 0);
+    let empty = stored(dir.path())?;
+    assert_eq!(empty["origins"], json!([]));
+    assert_eq!(empty["observations"], json!({}));
+    Ok(())
+}
+
+#[test]
+fn saved_generation_tracks_its_sidecar_basis_and_rejects_a_changed_authority() -> Result<()> {
+    let dir = setup()?;
+    add(dir.path(), &link("one", 2, json!({"version":1})))?;
+    assert_eq!(
+        run(
+            dir.path(),
+            &[
+                "generate",
+                "out.links",
+                "--extension",
+                "sets",
+                "--patch-out",
+                "generate.json"
+            ],
+            None
+        )?
+        .0,
+        0
+    );
+    let (code, applied) = run(dir.path(), &["apply", "generate.json"], None)?;
+    assert_eq!(code, 0, "{applied}");
+    let (code, replay) = run(
+        dir.path(),
+        &["--snapshot", applied["snapshot"].as_str().unwrap(), "links"],
+        None,
+    )?;
+    assert_eq!(code, 0, "{replay}");
+    assert_eq!(
+        replay["data"]["links"][0]["annotation"],
+        json!({"version":1})
+    );
+    assert_eq!(
+        run(
+            dir.path(),
+            &[
+                "generate",
+                "next.links",
+                "--extension",
+                "sets",
+                "--patch-out",
+                "stale.json"
+            ],
+            None
+        )?
+        .0,
+        0
+    );
+    let changed = link("one", 2, json!({"version":2}));
+    assert_eq!(
+        run(dir.path(), &["link", "set", "--link", "-"], Some(&changed))?.0,
+        0
+    );
+    let (code, stale) = run(dir.path(), &["apply", "stale.json"], None)?;
+    assert_eq!(code, 2, "{stale}");
+    assert!(stale["error"].as_str().unwrap().contains("Sidecar changed"));
+    assert!(!dir.path().join("next.links").exists());
+    Ok(())
+}
+
+#[test]
+fn human_output_shows_link_identity_annotation_and_import_origin() -> Result<()> {
+    let dir = setup()?;
+    fs::write(
+        dir.path().join("source.links"),
+        serde_json::to_vec(&json!({"links":[link("readable",2,json!({"note":"visible"}))]}))?,
+    )?;
+    assert_eq!(
+        run(
+            dir.path(),
+            &["import", "source.links", "--extension", "sets"],
+            None
+        )?
+        .0,
+        0
+    );
+    let output = Command::new(env!("CARGO_BIN_EXE_monika"))
+        .current_dir(dir.path())
+        .args(["links"])
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8(output.stdout)?;
+    assert!(
+        text.contains("readable")
+            && text.contains("visible")
+            && text.contains("imported from")
+            && text.contains("source.links")
+            && text.contains("Observation"),
+        "{text}"
+    );
+    Ok(())
+}
+
+#[test]
+fn incomplete_import_does_not_register_even_successfully_read_candidates() -> Result<()> {
+    let dir = setup()?;
+    configure_variant(dir.path(), "partial")?;
+    let before = stored(dir.path())?;
+    fs::write(
+        dir.path().join("partial.links"),
+        serde_json::to_vec(&json!({"links":[link("partial",0,json!(null))]}))?,
+    )?;
+    let (code, failed) = run(
+        dir.path(),
+        &["import", "partial.links", "--extension", "partial"],
+        None,
+    )?;
+    assert_eq!(code, 2, "{failed}");
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap()
+            .contains("import was incomplete")
+    );
+    assert_eq!(stored(dir.path())?, before);
     Ok(())
 }

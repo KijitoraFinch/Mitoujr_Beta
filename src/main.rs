@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use monika::cancellation::{Interrupt, Signals};
-use monika::editing::{Change, Destination, Pick};
+use monika::editing::{Change, Destination};
 use monika::extensions::process::Host;
 use monika::operations::{self, Operation, Response};
 use monika::query::{self, Expression, Operand, Predicate};
@@ -39,20 +39,46 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Create monika.json with no built-in extensions or sources
+    /// Create configuration and the dedicated Sidecar
     Init,
     /// Resolve a selector or @named target and display its content
     Show { target: String },
-    /// List declarations, evidence, unresolved endpoints, and conflicts
+    /// Query Links in the Sidecar
     Links(FilterArgs),
-    /// Check endpoints, conflicts, and configured annotation checkers
-    Check(FilterArgs),
-    /// Add, replace, remove, or copy a declaration in its source resource
+    /// Resolve selected Links and run annotation checks
+    Check {
+        #[command(flatten)]
+        filter: FilterArgs,
+        #[arg(
+            long,
+            help = "Compare selected Links with the Sidecar to detect semantic duplicates"
+        )]
+        duplicates: bool,
+    },
+    /// Add, replace, or remove a Link in the Sidecar
     Link {
         #[command(subcommand)]
         command: LinkCommand,
     },
-    /// Apply a saved patch after checking the resource's current state
+    /// Import Links from a fixed Observation into the Sidecar
+    Import {
+        resource: String,
+        #[arg(long)]
+        extension: String,
+        #[command(flatten)]
+        edit: EditArgs,
+    },
+    /// Generate an external representation of selected Links
+    Generate {
+        resource: String,
+        #[arg(long)]
+        extension: String,
+        #[command(flatten)]
+        filter: FilterArgs,
+        #[command(flatten)]
+        edit: EditArgs,
+    },
+    /// Apply a saved patch after checking its original state
     Apply { patch: PathBuf },
     /// Inspect and test configured external extensions
     Extension {
@@ -93,21 +119,8 @@ enum ExtensionCommand {
 
 #[derive(Args)]
 struct EditArgs {
-    #[arg(long = "in", help = "Resource containing the declaration")]
-    resource: String,
-    #[arg(long, help = "External extraction/editing extension")]
-    extension: String,
     #[arg(long, help = "Save a reviewable patch instead of applying it")]
     patch_out: Option<PathBuf>,
-}
-
-#[derive(Args)]
-#[group(required = true, multiple = false)]
-struct PickArgs {
-    #[arg(long)]
-    id: Option<String>,
-    #[arg(long, help = "Evidence location as JSON")]
-    at: Option<String>,
 }
 
 #[derive(Subcommand)]
@@ -115,94 +128,42 @@ enum LinkCommand {
     Add {
         #[command(flatten)]
         edit: EditArgs,
-        #[arg(long, help = "Declaration JSON file; '-' reads stdin")]
-        declaration: PathBuf,
+        #[arg(long, help = "Link JSON file, including its ID; '-' reads stdin")]
+        link: PathBuf,
     },
     Set {
         #[command(flatten)]
         edit: EditArgs,
-        #[command(flatten)]
-        pick: PickArgs,
-        #[arg(long)]
-        declaration: PathBuf,
+        #[arg(
+            long,
+            help = "Replacement Link JSON with the existing ID; '-' reads stdin"
+        )]
+        link: PathBuf,
     },
     Remove {
         #[command(flatten)]
         edit: EditArgs,
-        #[command(flatten)]
-        pick: PickArgs,
+        id: String,
     },
-    Copy {
-        #[command(flatten)]
-        edit: EditArgs,
-        #[command(flatten)]
-        pick: PickArgs,
-        #[arg(long)]
-        from: String,
-        #[arg(long)]
-        from_extension: String,
-    },
-}
-
-impl PickArgs {
-    fn value(self) -> Result<Pick> {
-        Ok(Pick {
-            id: self.id,
-            location: self
-                .at
-                .map(|value| serde_json::from_str(&value))
-                .transpose()
-                .context("invalid evidence location JSON")?,
-        })
-    }
 }
 
 async fn edit_operation(command: LinkCommand) -> Result<Operation> {
     let (edit, change) = match command {
-        LinkCommand::Add { edit, declaration } => (
+        LinkCommand::Add { edit, link } => (
             edit,
             Change::Add {
-                declaration: serde_json::from_value(read_json(Some(&declaration)).await?)?,
+                link: serde_json::from_value(read_json(Some(&link)).await?)?,
             },
         ),
-        LinkCommand::Set {
-            edit,
-            pick,
-            declaration,
-        } => (
+        LinkCommand::Set { edit, link } => (
             edit,
             Change::Set {
-                pick: pick.value()?,
-                declaration: serde_json::from_value(read_json(Some(&declaration)).await?)?,
+                link: serde_json::from_value(read_json(Some(&link)).await?)?,
             },
         ),
-        LinkCommand::Remove { edit, pick } => (
-            edit,
-            Change::Remove {
-                pick: pick.value()?,
-            },
-        ),
-        LinkCommand::Copy {
-            edit,
-            pick,
-            from,
-            from_extension,
-        } => (
-            edit,
-            Change::Copy {
-                from: Destination {
-                    resource: from,
-                    extension: from_extension,
-                },
-                pick: pick.value()?,
-            },
-        ),
+        LinkCommand::Remove { edit, id } => (edit, Change::Remove { id }),
     };
     Ok(Operation::Edit {
-        destination: Destination {
-            resource: edit.resource,
-            extension: edit.extension,
-        },
         change,
         patch_out: edit.patch_out,
     })
@@ -260,8 +221,36 @@ async fn operation(command: Command) -> Result<Operation> {
         Command::Links(args) => Operation::Links {
             filter: filter(args)?,
         },
-        Command::Check(args) => Operation::Check {
+        Command::Check {
+            filter: args,
+            duplicates,
+        } => Operation::Check {
             filter: filter(args)?,
+            duplicates,
+        },
+        Command::Import {
+            resource,
+            extension,
+            edit,
+        } => Operation::Import {
+            source: Destination {
+                resource,
+                extension,
+            },
+            patch_out: edit.patch_out,
+        },
+        Command::Generate {
+            resource,
+            extension,
+            filter: args,
+            edit,
+        } => Operation::Generate {
+            destination: Destination {
+                resource,
+                extension,
+            },
+            filter: filter(args)?,
+            patch_out: edit.patch_out,
         },
         Command::Link { command } => edit_operation(command).await?,
         Command::Apply { patch } => Operation::Apply {
@@ -295,47 +284,37 @@ fn render_human(response: &Response) -> Result<(Vec<u8>, Vec<u8>)> {
             }
         } else if data.get("links").is_some() || data.get("selection").is_some() {
             let selection = data.get("selection").unwrap_or(data);
+            let mut origins: std::collections::BTreeMap<&str, Vec<&Value>> =
+                std::collections::BTreeMap::new();
+            for origin in selection["origins"].as_array().context("missing origins")? {
+                origins
+                    .entry(origin["link"].as_str().context("missing origin Link ID")?)
+                    .or_default()
+                    .push(origin);
+            }
             for link in selection["links"]
                 .as_array()
                 .context("invalid selection result")?
             {
-                let key = link["key"].as_str().context("missing link key")?;
-                let occurrences = link["occurrences"].as_array().context("missing evidence")?;
-                let ids: std::collections::BTreeSet<_> = occurrences
-                    .iter()
-                    .filter_map(|occurrence| occurrence["declaration"]["id"].as_str())
-                    .collect();
                 writeln!(
                     stdout,
-                    "{} [{}]  {} -> {}  ({} evidence)",
-                    &key[..12],
-                    ids.into_iter().collect::<Vec<_>>().join(", "),
-                    link["source"]["selector"],
-                    link["target"]["selector"],
-                    occurrences.len()
+                    "{}  {} -> {}",
+                    link["id"].as_str().context("missing Link ID")?,
+                    link["source"],
+                    link["reference"]["target"]
                 )?;
-                for occurrence in occurrences {
-                    let evidence = &occurrence["evidence"];
-                    writeln!(
-                        stdout,
-                        "  declared in {} at {}{}",
-                        evidence["resource"],
-                        evidence["location"],
-                        if evidence["writable"] == true {
-                            ""
-                        } else {
-                            " (read-only)"
-                        }
-                    )?;
-                }
-                writeln!(
-                    stdout,
-                    "  annotation: {}",
-                    occurrences[0]["declaration"]["annotation"]
-                )?;
-                for endpoint in ["source", "target"] {
-                    if let Some(error) = link[endpoint]["error"].as_str() {
-                        writeln!(stdout, "  {endpoint} unresolved: {error}")?;
+                writeln!(stdout, "  annotation: {}", link["annotation"])?;
+                if let Some(imports) = origins.get(link["id"].as_str().unwrap()) {
+                    for origin in imports {
+                        let id = origin["observation"]
+                            .as_str()
+                            .context("missing origin Observation ID")?;
+                        let observation = &selection["observations"][id];
+                        writeln!(
+                            stdout,
+                            "  imported from {} at {} (Observation {})",
+                            observation["resource"], origin["location"], id
+                        )?;
                     }
                 }
             }
@@ -346,18 +325,13 @@ fn render_human(response: &Response) -> Result<(Vec<u8>, Vec<u8>)> {
                 writeln!(
                     stdout,
                     "undetermined {}: {}",
-                    unknown["link"]["key"], unknown["reason"]
+                    unknown["link"]["id"], unknown["reason"]
                 )?;
             }
-            for conflict in selection["conflicts"]
-                .as_array()
-                .context("missing conflicts")?
-            {
-                writeln!(
-                    stdout,
-                    "conflict {}: {}",
-                    conflict["id"], conflict["variants"]
-                )?;
+            if let Some(duplicates) = data["duplicates"].as_array() {
+                for pair in duplicates {
+                    writeln!(stdout, "duplicate Links: {} and {}", pair[0], pair[1])?;
+                }
             }
             for diagnostic in selection["diagnostics"]
                 .as_array()
@@ -376,7 +350,7 @@ fn render_human(response: &Response) -> Result<(Vec<u8>, Vec<u8>)> {
                             writeln!(
                                 stdout,
                                 "FAIL {} {}: {}",
-                                group["key"], group["extension"], finding["message"]
+                                group["id"], group["extension"], finding["message"]
                             )?;
                         }
                     }

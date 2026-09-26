@@ -1,10 +1,12 @@
 use crate::engine::Engine;
-use crate::extensions::{Extraction, Occurrence};
-use crate::model::{Declaration, Observation, ResourceState, digest, require_version};
+use crate::extensions::ImportResult;
+use crate::model::{Link, Observation, ResourceState, digest, require_version};
+use crate::sidecar::{self, Origin, Sidecar, SidecarState};
 use crate::workspace::{Session, timestamp};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,31 +16,11 @@ pub struct Destination {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Pick {
-    #[serde(default)]
-    pub id: Option<String>,
-    #[serde(default)]
-    pub location: Option<Value>,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Change {
-    Add {
-        declaration: Declaration,
-    },
-    Set {
-        pick: Pick,
-        declaration: Declaration,
-    },
-    Remove {
-        pick: Pick,
-    },
-    Copy {
-        from: Destination,
-        pick: Pick,
-    },
+    Add { link: Link },
+    Set { link: Link },
+    Remove { id: String },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -64,15 +46,28 @@ impl Content {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PatchChange {
+    Sidecar {
+        before: SidecarState,
+        after: Sidecar,
+    },
+    Resource {
+        sidecar: SidecarState,
+        provider_config_hash: String,
+        before: Observation,
+        replacement: Content,
+        after_hash: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Patch {
     pub version: u32,
     pub id: String,
     pub root: String,
-    pub provider_config_hash: String,
-    pub before: Observation,
-    pub replacement: Content,
-    pub after_hash: String,
+    pub change: PatchChange,
 }
 
 impl Patch {
@@ -81,148 +76,202 @@ impl Patch {
         self.id = digest(&serde_json::to_vec(self)?);
         Ok(())
     }
-
     pub fn validate(&self) -> Result<()> {
         require_version(self.version)?;
         let mut expected = self.clone();
         expected.seal()?;
         ensure!(expected.id == self.id, "patch integrity check failed");
-        ensure!(
-            digest(self.replacement.bytes()) == self.after_hash,
-            "patch replacement hash mismatch"
-        );
+        match &self.change {
+            PatchChange::Sidecar { before, after } => {
+                before.data.validate()?;
+                after.validate()?;
+            }
+            PatchChange::Resource {
+                sidecar,
+                replacement,
+                after_hash,
+                ..
+            } => {
+                sidecar.data.validate()?;
+                ensure!(
+                    digest(replacement.bytes()) == *after_hash,
+                    "patch replacement hash mismatch"
+                );
+            }
+        }
         Ok(())
     }
+    fn new(engine: &Engine<'_>, change: PatchChange) -> Result<Self> {
+        let mut patch = Self {
+            version: 1,
+            id: String::new(),
+            root: engine.session.snapshot.root.clone(),
+            change,
+        };
+        patch.seal()?;
+        Ok(patch)
+    }
 }
 
-async fn extract(
+fn sidecar_patch(engine: &Engine<'_>, before: SidecarState, mut after: Sidecar) -> Result<Patch> {
+    after.order();
+    if after != before.data {
+        after.revision = before
+            .data
+            .revision
+            .checked_add(1)
+            .context("Sidecar revision overflow")?;
+    }
+    after.validate()?;
+    Patch::new(engine, PatchChange::Sidecar { before, after })
+}
+
+pub async fn prepare(engine: &mut Engine<'_>, change: Change) -> Result<Patch> {
+    let before = engine.session.sidecar().await?.clone();
+    let mut after = before.data.clone();
+    match change {
+        Change::Add { link } => {
+            let link = sidecar::normalize(&engine.session.workspace, link).await?;
+            ensure!(
+                !after.links.iter().any(|item| item.id == link.id),
+                "Link ID already exists: {}",
+                link.id
+            );
+            after.links.push(link);
+        }
+        Change::Set { link } => {
+            let link = sidecar::normalize(&engine.session.workspace, link).await?;
+            let existing = after
+                .links
+                .iter_mut()
+                .find(|item| item.id == link.id)
+                .with_context(|| format!("Link not found: {}", link.id))?;
+            *existing = link;
+        }
+        Change::Remove { id } => {
+            let index = after
+                .links
+                .iter()
+                .position(|item| item.id == id)
+                .with_context(|| format!("Link not found: {id}"))?;
+            after.links.remove(index);
+            after.origins.retain(|origin| origin.link != id);
+        }
+    }
+    sidecar_patch(engine, before, after)
+}
+
+async fn interpret(
+    engine: &mut Engine<'_>,
+    extension: &str,
+    observation: &Observation,
+) -> Result<ImportResult> {
+    engine
+        .session
+        .workspace
+        .read_observation(observation)
+        .await?;
+    let result: ImportResult = serde_json::from_value(
+        engine
+            .call(
+                extension,
+                "import",
+                json!({
+                    "observation": observation,
+                    "content_path": engine.session.workspace.blob_path(observation)?,
+                }),
+            )
+            .await?,
+    )
+    .context("invalid import result")?;
+    ensure!(
+        result.diagnostics.is_empty(),
+        "import was incomplete: {}",
+        serde_json::to_string(&result.diagnostics)?
+    );
+    Ok(result)
+}
+
+pub async fn prepare_import(engine: &mut Engine<'_>, source: &Destination) -> Result<Patch> {
+    let before = engine.session.sidecar().await?.clone();
+    let observation = engine.observe(&source.resource).await?;
+    ensure!(
+        observation.state.exists,
+        "import Resource does not exist: {}",
+        observation.resource
+    );
+    let imported = interpret(engine, &source.extension, &observation).await?;
+    let revision = engine.manifest(&source.extension).await?.revision;
+    let mut after = before.data.clone();
+    let mut links: BTreeMap<_, _> = after
+        .links
+        .into_iter()
+        .map(|link| (link.id.clone(), link))
+        .collect();
+    let mut origins: BTreeSet<_> = after
+        .origins
+        .iter()
+        .map(|origin| origin.input_key(&after.observations[&origin.observation]))
+        .collect::<Result<_>>()?;
+    for candidate in imported.links {
+        let link = sidecar::normalize(&engine.session.workspace, candidate.link).await?;
+        if let Some(existing) = links.get(&link.id) {
+            ensure!(
+                *existing == link,
+                "import conflicts with Link ID {}; inspect and edit the Sidecar explicitly",
+                link.id
+            );
+        } else {
+            links.insert(link.id.clone(), link.clone());
+        }
+        let origin = Origin {
+            link: link.id,
+            observation: observation.id.clone(),
+            extension: source.extension.clone(),
+            revision: revision.clone(),
+            location: candidate.location,
+        };
+        if origins.insert(origin.input_key(&observation)?) {
+            after
+                .observations
+                .insert(observation.id.clone(), observation.clone());
+            after.origins.push(origin);
+        }
+    }
+    after.links = links.into_values().collect();
+    sidecar_patch(engine, before, after)
+}
+
+pub async fn prepare_generation(
     engine: &mut Engine<'_>,
     destination: &Destination,
-    observation: &Observation,
-) -> Result<Vec<Occurrence>> {
-    if !observation.state.exists {
-        return Ok(Vec::new());
-    }
-    let input = json!({"observation": observation, "content_path": engine.session.workspace.blob_path(observation)?});
-    let extracted: Extraction = serde_json::from_value(
-        engine
-            .call(&destination.extension, "extract", input)
-            .await?,
-    )?;
-    ensure!(
-        extracted.diagnostics.is_empty(),
-        "cannot edit incompletely interpreted declarations: {}",
-        serde_json::to_string(&extracted.diagnostics)?
-    );
-    for occurrence in &extracted.occurrences {
-        occurrence.declaration.validate()?;
+    links: &[Link],
+) -> Result<Patch> {
+    let sidecar = engine.session.sidecar().await?.clone();
+    let before = engine.observe(&destination.resource).await?;
+    // A generator must never overwrite Monika's authority or configuration.
+    let workspace = &engine.session.workspace;
+    for name in [sidecar::FILE_NAME, "monika.json", ".monika-sidecar.lock"] {
         ensure!(
-            occurrence.evidence.observation == observation.id
-                && occurrence.evidence.resource == observation.resource
-                && occurrence.evidence.extension == destination.extension,
-            "editor extraction returned evidence outside the supplied observation"
+            before.resource != workspace.resource(name).await?,
+            "cannot generate over Monika management data: {name}"
         );
     }
-    Ok(extracted.occurrences)
-}
-
-fn pick<'a>(occurrences: &'a [Occurrence], pick: &Pick) -> Result<&'a Occurrence> {
-    ensure!(
-        pick.id.is_some() != pick.location.is_some(),
-        "choose exactly one declaration ID or evidence location"
-    );
-    let matches: Vec<_> = occurrences
-        .iter()
-        .filter(|occurrence| {
-            if let Some(id) = &pick.id {
-                occurrence.declaration.id.as_ref() == Some(id)
-            } else {
-                Some(&occurrence.evidence.location) == pick.location.as_ref()
-            }
-        })
-        .collect();
-    ensure!(!matches.is_empty(), "declaration not found");
-    ensure!(
-        matches.len() == 1,
-        "multiple declarations match; choose an evidence location"
-    );
-    Ok(matches[0])
-}
-
-pub async fn prepare(
-    engine: &mut Engine<'_>,
-    destination: &Destination,
-    change: &Change,
-) -> Result<Patch> {
-    let before = engine.observe(&destination.resource).await?;
     ensure!(
         engine.manifest(&before.provider).await?.supports("commit"),
-        "resource provider {} cannot commit patches",
-        before.provider
+        "Resource provider cannot commit"
     );
-    let occurrences = extract(engine, destination, &before).await?;
-    let (request, expected, removed) = match change {
-        Change::Add { declaration } => (
-            json!({"op":"add", "declaration": declaration}),
-            Some(declaration.clone()),
-            None,
-        ),
-        Change::Set {
-            pick: selection,
-            declaration,
-        } => {
-            let occurrence = pick(&occurrences, selection)?;
-            ensure!(
-                occurrence.evidence.writable,
-                "this declaration is read-only in its source format"
-            );
-            (
-                json!({"op":"set", "location": occurrence.evidence.location, "declaration": declaration}),
-                Some(declaration.clone()),
-                None,
-            )
-        }
-        Change::Remove { pick: selection } => {
-            let occurrence = pick(&occurrences, selection)?;
-            ensure!(
-                occurrence.evidence.writable,
-                "this declaration is read-only in its source format"
-            );
-            (
-                json!({"op":"remove", "location": occurrence.evidence.location}),
-                None,
-                Some(occurrence.declaration.clone()),
-            )
-        }
-        Change::Copy {
-            from,
-            pick: selection,
-        } => {
-            let source = engine.observe(&from.resource).await?;
-            let extracted = extract(engine, from, &source).await?;
-            let declaration = pick(&extracted, selection)?.declaration.clone();
-            (
-                json!({"op":"add", "declaration": declaration}),
-                Some(declaration),
-                None,
-            )
-        }
-    };
-    if let Some(declaration) = &expected {
-        declaration.validate()?;
-    }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
-    struct EditResult {
+    struct Generated {
         bytes: Vec<u8>,
-        location: Option<Value>,
     }
-    let result: EditResult = serde_json::from_value(engine.call(&destination.extension, "edit", json!({
-        "observation": before, "content_path": engine.session.workspace.blob_path(&before)?, "change": request,
-    })).await?).context("invalid edit result")?;
+    let generated: Generated = serde_json::from_value(engine.call(&destination.extension, "generate", json!({
+        "observation": before, "content_path": engine.session.workspace.blob_path(&before)?, "links": links,
+    })).await?).context("invalid generate result")?;
     let proposed = Observation::new(
         before.resource.clone(),
-        &result.bytes,
+        &generated.bytes,
         timestamp(),
         before.provider.clone(),
         ResourceState {
@@ -233,127 +282,123 @@ pub async fn prepare(
     engine
         .session
         .workspace
-        .save_observation(&proposed, &result.bytes)
+        .save_observation(&proposed, &generated.bytes)
         .await?;
-    let after = extract(engine, destination, &proposed).await?;
-    if let Some(expected) = expected {
-        let location = result
-            .location
-            .context("editor must return the added or changed declaration location")?;
-        let selected = pick(
-            &after,
-            &Pick {
-                id: None,
-                location: Some(location),
-            },
-        )?;
-        ensure!(
-            selected.declaration == expected,
-            "editor changed the requested declaration, target, or annotation"
-        );
-        let expected_count = occurrences.len()
-            + usize::from(matches!(change, Change::Add { .. } | Change::Copy { .. }));
-        ensure!(
-            after.len() == expected_count,
-            "editor added or removed unexpected declarations"
-        );
+    let imported = interpret(engine, &destination.extension, &proposed).await?;
+    let mut actual = Vec::new();
+    for candidate in imported.links {
+        actual.push(sidecar::normalize(&engine.session.workspace, candidate.link).await?);
     }
-    if let Some(removed) = removed {
-        let old_count = occurrences
-            .iter()
-            .filter(|occurrence| occurrence.declaration == removed)
-            .count();
-        let new_count = after
-            .iter()
-            .filter(|occurrence| occurrence.declaration == removed)
-            .count();
-        ensure!(
-            old_count == new_count + 1 && occurrences.len() == after.len() + 1,
-            "editor did not remove exactly the selected declaration"
-        );
-    }
-    let config = &engine.session.workspace.config.extensions[&before.provider];
-    let mut patch = Patch {
-        version: 1,
-        id: String::new(),
-        root: engine.session.snapshot.root.clone(),
-        provider_config_hash: digest(&serde_json::to_vec(config)?),
-        before,
-        after_hash: digest(&result.bytes),
-        replacement: Content::from_bytes(result.bytes),
-    };
-    patch.seal()?;
-    Ok(patch)
+    actual.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut expected = links.to_vec();
+    expected.sort_by(|a, b| a.id.cmp(&b.id));
+    ensure!(
+        actual == expected,
+        "generator changed the selected Links, RegionSelectors, or annotations"
+    );
+    Patch::new(
+        engine,
+        PatchChange::Resource {
+            sidecar,
+            provider_config_hash: digest(&serde_json::to_vec(
+                &engine.session.workspace.config.extensions[&before.provider],
+            )?),
+            before,
+            after_hash: digest(&generated.bytes),
+            replacement: Content::from_bytes(generated.bytes),
+        },
+    )
 }
 
 pub async fn apply(engine: &mut Engine<'_>, patch: &Patch) -> Result<Value> {
     patch.validate()?;
     ensure!(
         !engine.session.frozen,
-        "patch application requires current observations; omit --snapshot"
+        "patch application requires current state; omit --snapshot"
     );
     ensure!(
         patch.root == engine.session.snapshot.root,
         "patch belongs to a different workspace"
     );
-    let config = engine
-        .session
-        .workspace
-        .config
-        .extensions
-        .get(&patch.before.provider)
-        .context("patch resource provider is not configured")?;
-    ensure!(
-        digest(&serde_json::to_vec(config)?) == patch.provider_config_hash,
-        "resource provider configuration changed since the patch was prepared"
-    );
-    engine
-        .session
-        .workspace
-        .read_observation(&patch.before)
-        .await?;
-    // A separate session deliberately bypasses observations cached while preparing
-    // the patch. The provider must also perform conditional commit atomically.
-    let mut current = Engine::new(Session::new(engine.session.workspace.clone())?, engine.host)?;
-    let observed = current.observe(&patch.before.resource).await?;
-    ensure!(
-        observed.provider == patch.before.provider
-            && observed.content_hash == patch.before.content_hash
-            && observed.state == patch.before.state,
-        "resource changed since the patch was prepared: {}",
-        patch.before.resource
-    );
-    let result = current.call(
-        &patch.before.provider,
-        "commit",
-        json!({
-            "resource": patch.before.resource,
-            "expected": {"content_hash": patch.before.content_hash, "state": patch.before.state},
-            "replacement": {"content_hash": patch.after_hash, "bytes": patch.replacement.bytes()},
-            "patch_id": patch.id,
-        }),
-    ).await?;
-    #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
-    struct Committed {
-        content_hash: String,
-        state: ResourceState,
+    match &patch.change {
+        PatchChange::Sidecar { before, after } => {
+            sidecar::commit(&engine.session.workspace, before, after).await?;
+            engine.session.snapshot.sidecar = Some(before.clone());
+            let mut session = Session::new(engine.session.workspace.clone())?;
+            session.snapshot.observations = engine.session.snapshot.observations.clone();
+            session.snapshot.failures = engine.session.snapshot.failures.clone();
+            session.snapshot.resolution_reads = engine.session.snapshot.resolution_reads.clone();
+            let state = session.sidecar().await?.clone();
+            ensure!(
+                state.data == *after,
+                "Sidecar changed after commit; inspect current state"
+            );
+            Ok(
+                json!({"patch": patch.id, "sidecar": state.content_hash, "snapshot": session.save().await?}),
+            )
+        }
+        PatchChange::Resource {
+            sidecar,
+            provider_config_hash,
+            before,
+            replacement,
+            after_hash,
+        } => {
+            ensure!(
+                sidecar::read(&engine.session.workspace).await?.content_hash
+                    == sidecar.content_hash,
+                "Sidecar changed since generation was prepared"
+            );
+            engine.session.snapshot.sidecar = Some(sidecar.clone());
+            let config = engine
+                .session
+                .workspace
+                .config
+                .extensions
+                .get(&before.provider)
+                .context("patch Resource provider is not configured")?;
+            ensure!(
+                digest(&serde_json::to_vec(config)?) == *provider_config_hash,
+                "Resource provider configuration changed since the patch was prepared"
+            );
+            engine.session.workspace.read_observation(before).await?;
+            let mut current =
+                Engine::new(Session::new(engine.session.workspace.clone())?, engine.host)?;
+            let observed = current.observe(&before.resource).await?;
+            ensure!(
+                observed.provider == before.provider
+                    && observed.content_hash == before.content_hash
+                    && observed.state == before.state,
+                "Resource changed since the patch was prepared: {}",
+                before.resource
+            );
+            let result = current.call(&before.provider, "commit", json!({
+                "resource": before.resource, "expected": {"content_hash": before.content_hash, "state": before.state},
+                "replacement": {"content_hash": after_hash, "bytes": replacement.bytes()}, "patch_id": patch.id,
+            })).await?;
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Committed {
+                content_hash: String,
+                state: ResourceState,
+            }
+            let committed: Committed = serde_json::from_value(result)
+                .context("invalid commit result; inspect Resource state before retrying")?;
+            ensure!(
+                committed.content_hash == *after_hash && committed.state.exists,
+                "commit result does not confirm proposed content; inspect Resource state before retrying"
+            );
+            let mut after =
+                Engine::new(Session::new(engine.session.workspace.clone())?, engine.host)?;
+            let observation = after.observe(&before.resource).await?;
+            ensure!(
+                observation.content_hash == *after_hash && observation.state == committed.state,
+                "Resource does not match committed patch; inspect Resource state before retrying"
+            );
+            after.session.snapshot.sidecar = Some(sidecar.clone());
+            Ok(
+                json!({"patch": patch.id, "resource": before.resource, "observation": observation, "snapshot": after.session.save().await?}),
+            )
+        }
     }
-    let committed: Committed = serde_json::from_value(result)
-        .context("invalid commit result; inspect resource state before retrying")?;
-    ensure!(
-        committed.content_hash == patch.after_hash && committed.state.exists,
-        "commit result does not confirm the proposed content; inspect resource state before retrying"
-    );
-    // Read back the resource through its provider, independently of the commit
-    // response. Never turn an unconfirmed write into a successful patch result.
-    let mut after = Engine::new(Session::new(engine.session.workspace.clone())?, engine.host)?;
-    let observation = after.observe(&patch.before.resource).await?;
-    ensure!(
-        observation.content_hash == patch.after_hash && observation.state == committed.state,
-        "resource does not match the committed patch; inspect resource state before retrying"
-    );
-    Ok(
-        json!({"patch": patch.id, "resource": patch.before.resource, "observation": observation, "snapshot": after.session.save().await?}),
-    )
 }

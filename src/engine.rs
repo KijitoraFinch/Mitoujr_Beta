@@ -1,15 +1,9 @@
 use crate::extensions::process::ResolutionEvent;
-use crate::extensions::{
-    Extraction,
-    process::{self, Manifest},
-};
-use crate::model::{
-    Diagnostic, Observation, Region, Relation, ResourceState, Selector, SnapshotSource,
-};
+use crate::extensions::process::{self, Manifest};
+use crate::model::{Diagnostic, Observation, Region, RegionSelector, Relation, ResourceState};
 use crate::observations::ReadScope;
 use crate::workspace::Session;
 use anyhow::{Context, Result, bail, ensure};
-use globset::Glob;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -168,7 +162,7 @@ impl<'host> Engine<'host> {
         )
     }
 
-    pub async fn resolve(&mut self, selector: &Selector) -> Result<Region> {
+    pub async fn resolve(&mut self, selector: &RegionSelector) -> Result<Region> {
         let key = serde_json::to_string(&selector)?;
         if let Some(result) = self.resolutions.get(&key) {
             return result.clone().map_err(anyhow::Error::msg);
@@ -181,7 +175,7 @@ impl<'host> Engine<'host> {
         result.map_err(anyhow::Error::msg)
     }
 
-    pub(crate) async fn resolve_uncached(&mut self, selector: &Selector) -> Result<Region> {
+    pub(crate) async fn resolve_uncached(&mut self, selector: &RegionSelector) -> Result<Region> {
         let manifest = self.manifest(&selector.extension).await?;
         ensure!(
             manifest.supports("resolve"),
@@ -221,8 +215,6 @@ impl<'host> Engine<'host> {
         #[serde(deny_unknown_fields)]
         struct Resolved {
             domain: String,
-            #[serde(default)]
-            equivalence_key: Option<String>,
             identity: Value,
             content: Value,
         }
@@ -234,7 +226,6 @@ impl<'host> Engine<'host> {
         );
         Ok(Region {
             domain: result.domain,
-            equivalence_key: result.equivalence_key,
             identity: result.identity,
             content: result.content,
             observations: scope.finish()?,
@@ -243,7 +234,7 @@ impl<'host> Engine<'host> {
 
     async fn resolve_with_reads(
         &mut self,
-        selector: &Selector,
+        selector: &RegionSelector,
         scope: &mut ReadScope,
     ) -> Result<Value> {
         let root = self.session.workspace.root.clone();
@@ -320,138 +311,5 @@ impl<'host> Engine<'host> {
             .await?,
         )
         .context("invalid comparison result")
-    }
-
-    pub async fn sources(&mut self) -> Result<Vec<SnapshotSource>> {
-        if let Some(sources) = &self.session.snapshot.sources {
-            return Ok(sources.clone());
-        }
-        ensure!(
-            !self.session.frozen,
-            "this snapshot did not include a source scan"
-        );
-        let workspace = &self.session.workspace;
-        let matchers: Vec<_> = workspace
-            .config
-            .sources
-            .iter()
-            .map(|source| {
-                Ok((
-                    Glob::new(&source.pattern)?.compile_matcher(),
-                    source.extension.clone(),
-                ))
-            })
-            .collect::<Result<_>>()?;
-        let mut sources = Vec::new();
-        for source in &workspace.config.resources {
-            sources.push(SnapshotSource {
-                resource: workspace.resource(&source.resource).await?,
-                extension: source.extension.clone(),
-            });
-        }
-        let mut diagnostics = Vec::new();
-        if !matchers.is_empty() {
-            let root = workspace.root.clone();
-            let entries = tokio::task::spawn_blocking(move || {
-                ignore::WalkBuilder::new(&root)
-                    .hidden(false)
-                    .git_global(false)
-                    .require_git(false)
-                    .filter_entry(move |entry| {
-                        entry.path() != root.join(".monika") && entry.path() != root.join(".git")
-                    })
-                    .build()
-                    .collect::<Vec<_>>()
-            })
-            .await?;
-            for entry in entries {
-                match entry {
-                    Ok(entry) => {
-                        if let Some(error) = entry.error() {
-                            diagnostics.push(Diagnostic {
-                                stage: "scan".into(),
-                                subject: entry.path().display().to_string(),
-                                message: error.to_string(),
-                            });
-                        }
-                        if !entry
-                            .file_type()
-                            .is_some_and(|kind| kind.is_file() || kind.is_symlink())
-                        {
-                            continue;
-                        }
-                        let relative = entry.path().strip_prefix(&workspace.root)?;
-                        for (matcher, extension) in &matchers {
-                            if matcher.is_match(relative) {
-                                sources.push(SnapshotSource {
-                                    resource: workspace.path_resource(entry.path()).await?,
-                                    extension: extension.clone(),
-                                });
-                            }
-                        }
-                    }
-                    Err(error) => diagnostics.push(Diagnostic {
-                        stage: "scan".into(),
-                        subject: workspace.root.display().to_string(),
-                        message: error.to_string(),
-                    }),
-                }
-            }
-        }
-        sources.sort_by(|a, b| (&a.resource, &a.extension).cmp(&(&b.resource, &b.extension)));
-        sources.dedup_by(|a, b| a.resource == b.resource && a.extension == b.extension);
-        self.session.snapshot.diagnostics.extend(diagnostics);
-        self.session.snapshot.sources = Some(sources.clone());
-        Ok(sources)
-    }
-
-    pub async fn extract(&mut self) -> Result<Extraction> {
-        let sources = self.sources().await?;
-        let mut result = Extraction {
-            occurrences: Vec::new(),
-            diagnostics: self.session.snapshot.diagnostics.clone(),
-        };
-        for source in sources {
-            let extracted = (async {
-                ensure!(
-                    self.manifest(&source.extension).await?.supports("extract"),
-                    "extension {} does not extract declarations",
-                    source.extension
-                );
-                let observation = self.observe(&source.resource).await?;
-                ensure!(
-                    observation.state.exists,
-                    "resource does not exist: {}",
-                    observation.resource
-                );
-                let input = self.observation_input(&observation).await?;
-                let extraction: Extraction =
-                    serde_json::from_value(self.call(&source.extension, "extract", input).await?)?;
-                for occurrence in &extraction.occurrences {
-                    occurrence.declaration.validate()?;
-                    ensure!(
-                        occurrence.evidence.observation == observation.id
-                            && occurrence.evidence.resource == observation.resource
-                            && occurrence.evidence.extension == source.extension,
-                        "extension {} returned evidence outside the supplied observation",
-                        source.extension
-                    );
-                }
-                Ok(extraction)
-            })
-            .await;
-            match extracted {
-                Ok(extracted) => {
-                    result.occurrences.extend(extracted.occurrences);
-                    result.diagnostics.extend(extracted.diagnostics);
-                }
-                Err(error) => result.diagnostics.push(Diagnostic {
-                    stage: "extract".into(),
-                    subject: source.resource,
-                    message: format!("{error:#}"),
-                }),
-            }
-        }
-        Ok(result)
     }
 }

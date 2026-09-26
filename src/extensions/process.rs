@@ -54,10 +54,10 @@ impl Manifest {
                 "a checker must provide check_plan and check"
             );
         }
-        if self.supports("edit") {
+        if self.supports("generate") {
             ensure!(
-                self.supports("extract"),
-                "an editor must provide extract and edit"
+                self.supports("import"),
+                "a generator must provide import for round-trip validation"
             );
         }
         if self.supports("commit") {

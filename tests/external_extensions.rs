@@ -1,8 +1,8 @@
 use anyhow::Result;
 use monika::engine::Engine;
 use monika::extensions::process;
-use monika::model::{Relation, Selector};
-use monika::workspace::{Config, ProcessExtension, Session, Source, Workspace};
+use monika::model::{RegionSelector, Relation};
+use monika::workspace::{Config, ProcessExtension, Session, Workspace};
 use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
@@ -38,7 +38,7 @@ async fn real_process_resolves_multiple_observations_and_replays_saved_content()
     let workspace = configure(dir.path()).await?;
     let a = workspace.resource("a.json").await?;
     let b = workspace.resource("b.json").await?;
-    let selector = |minimum| Selector {
+    let selector = |minimum| RegionSelector {
         extension: "sets".into(),
         resource: None,
         query: json!({"resources": [a, b], "minimum": minimum}),
@@ -89,7 +89,7 @@ async fn process_observation_freezes_external_resource_and_reports_failure() -> 
     assert!(!engine.observe(&missing).await?.state.exists);
     assert!(
         engine
-            .resolve(&Selector {
+            .resolve(&RegionSelector {
                 extension: "sets".into(),
                 resource: None,
                 query: json!({"resources":[missing]})
@@ -155,63 +155,17 @@ async fn extension_protocol_rejects_wrong_revision_and_reports_errors_and_timeou
 }
 
 #[tokio::test]
-async fn snapshot_reuses_source_inventory_instead_of_scanning_live_files() -> Result<()> {
-    let mut host = process::Host::default();
-    let dir = tempfile::tempdir()?;
-    let mut workspace = configure(dir.path()).await?;
-    workspace.config.sources.push(Source {
-        pattern: "*.links".into(),
-        extension: "sets".into(),
-    });
-    fs::write(
-        dir.path().join("monika.json"),
-        serde_json::to_vec(&workspace.config)?,
-    )?;
-    let document = json!({"links": [{
-        "source": {"extension": "sets", "query": {"resources": [], "minimum": 0}},
-        "reference": {"target": {"extension": "sets", "query": {"resources": [], "minimum": 1}}},
-        "annotation": {"arbitrary": [true, {"日本語": null}]}
-    }]});
-    fs::write(
-        dir.path().join("original.links"),
-        serde_json::to_vec(&document)?,
-    )?;
-    let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
-    let original = engine.extract().await?;
-    assert!(
-        original.diagnostics.is_empty(),
-        "{:?}",
-        original.diagnostics
-    );
-    assert_eq!(original.occurrences.len(), 1);
-    let snapshot = engine.session.save().await?;
-    fs::remove_file(dir.path().join("original.links"))?;
-    fs::write(
-        dir.path().join("added.links"),
-        serde_json::to_vec(&document)?,
-    )?;
-    let mut replay = Engine::new(
-        Session::replay(Workspace::open(dir.path()).await?, &snapshot).await?,
-        &mut host,
-    )?;
-    assert_eq!(replay.extract().await?.occurrences, original.occurrences);
-    host.shutdown(false).await?;
-    Ok(())
-}
-
-#[tokio::test]
 async fn empty_configuration_has_no_builtin_extensions_or_observation_provider() -> Result<()> {
     let mut host = process::Host::default();
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("sample.md"), "[link](somewhere)\n")?;
     let mut engine = Engine::new(Session::new(Workspace::open(dir.path()).await?)?, &mut host)?;
     assert!(engine.manifests().await?.is_empty());
-    assert!(engine.sources().await?.is_empty());
-    assert!(engine.extract().await?.occurrences.is_empty());
+    assert!(engine.session.sidecar().await.is_err());
     for name in ["file", "text", "md", "sidecar", "rust", "ts", "python"] {
         assert!(
             engine
-                .resolve(&Selector::parse(&format!("{name}:sample.md"))?)
+                .resolve(&RegionSelector::parse(&format!("{name}:sample.md"))?)
                 .await
                 .is_err()
         );
@@ -240,23 +194,23 @@ async fn external_regions_obey_comparison_laws_including_empty_and_multi_resourc
     let other = workspace.resource("more.json").await?;
     let mut selectors: Vec<_> = [0, 2, 3, 6]
         .into_iter()
-        .map(|minimum| Selector {
+        .map(|minimum| RegionSelector {
             extension: "sets".into(),
             resource: None,
             query: json!({"resources": [resource, other], "minimum": minimum}),
         })
         .collect();
-    selectors.push(Selector {
+    selectors.push(RegionSelector {
         extension: "sets".into(),
         resource: None,
         query: json!({"resources":[resource],"minimum":0}),
     });
-    selectors.push(Selector {
+    selectors.push(RegionSelector {
         extension: "sets".into(),
         resource: None,
         query: json!({"resources":[other],"minimum":0}),
     });
-    selectors.push(Selector {
+    selectors.push(RegionSelector {
         extension: "sets".into(),
         resource: None,
         query: json!({"resources":[resource],"minimum":6}),
@@ -285,7 +239,7 @@ async fn separate_extensions_share_a_comparison_domain_via_explicit_provider() -
         .comparators
         .insert("test.sets.v1".into(), "sets".into());
     let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
-    let make_selector = |extension: &str, minimum| Selector {
+    let make_selector = |extension: &str, minimum| RegionSelector {
         extension: extension.into(),
         resource: None,
         query: json!({"resources": [resource], "minimum": minimum}),
@@ -368,6 +322,46 @@ async fn worker_timeout_covers_a_blocked_stdin_write() -> Result<()> {
         .unwrap_err();
     assert!(error.to_string().contains("timed out"), "{error:#}");
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    host.shutdown(false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn import_interprets_the_observation_even_after_the_resource_changes() -> Result<()> {
+    use monika::editing::{self, Destination};
+    let dir = tempfile::tempdir()?;
+    let workspace = Workspace::open(dir.path()).await?;
+    workspace.initialize().await?;
+    let workspace = configure(dir.path()).await?;
+    let link = json!({"id":"frozen","source":{"extension":"sets","resource":"rows.json","query":"0"},
+        "reference":{"target":{"extension":"sets","resource":"rows.json","query":"2"}},"annotation":{"state":"original"}});
+    fs::write(
+        dir.path().join("input.json"),
+        serde_json::to_vec(&json!({"links":[link]}))?,
+    )?;
+    let mut host = process::Host::default();
+    let mut engine = Engine::new(Session::new(workspace.clone())?, &mut host)?;
+    let observed = engine.observe("input.json").await?;
+    fs::write(
+        dir.path().join("input.json"),
+        "changed after observing; no longer JSON",
+    )?;
+    let patch = editing::prepare_import(
+        &mut engine,
+        &Destination {
+            resource: "input.json".into(),
+            extension: "sets".into(),
+        },
+    )
+    .await?;
+    let result = editing::apply(&mut engine, &patch).await?;
+    let state = monika::sidecar::read(&workspace).await?;
+    assert_eq!(state.data.links[0].annotation, link["annotation"]);
+    assert_eq!(state.data.observations.len(), 1);
+    assert_eq!(state.data.origins[0].observation, observed.id);
+    let mut replay = Session::replay(workspace, result["snapshot"].as_str().unwrap()).await?;
+    assert_eq!(replay.sidecar().await?.data.links, state.data.links);
+    assert_eq!(replay.snapshot.observations[&observed.resource], observed);
     host.shutdown(false).await?;
     Ok(())
 }

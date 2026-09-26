@@ -1,27 +1,20 @@
 pub mod process;
 
-use crate::model::{Declaration, Diagnostic};
+use crate::model::{Diagnostic, Link};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Evidence {
-    pub resource: String,
-    pub observation: String,
-    pub extension: String,
-    /// An extension-owned location, used unchanged when requesting an edit.
+/// A Link interpreted from the supplied, immutable Observation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportCandidate {
+    pub link: Link,
     pub location: Value,
-    pub writable: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub struct Occurrence {
-    pub declaration: Declaration,
-    pub evidence: Evidence,
-}
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct Extraction {
-    pub occurrences: Vec<Occurrence>,
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ImportResult {
+    pub links: Vec<ImportCandidate>,
     pub diagnostics: Vec<Diagnostic>,
 }

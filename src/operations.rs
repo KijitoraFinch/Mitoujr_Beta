@@ -1,9 +1,10 @@
 use crate::editing::{self, Change, Destination, Patch};
 use crate::engine::Engine;
 use crate::extension_test;
-use crate::graph::{self, Conflict, Endpoint, Link};
-use crate::model::{Diagnostic, Selector, Target};
+use crate::links::Endpoint;
+use crate::model::{Diagnostic, Link, Observation, RegionSelector, Relation, Target};
 use crate::query::Expression;
+use crate::sidecar::Origin;
 use crate::workspace::{Session, Workspace};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
@@ -24,17 +25,30 @@ pub enum Operation {
     Check {
         #[serde(default, rename = "where")]
         filter: Option<Expression>,
+        #[serde(default)]
+        duplicates: bool,
     },
     ExtensionList,
     ExtensionShow {
         name: String,
     },
     ExtensionTest {
-        selectors: Vec<Selector>,
+        selectors: Vec<RegionSelector>,
     },
     Edit {
-        destination: Destination,
         change: Change,
+        #[serde(default)]
+        patch_out: Option<std::path::PathBuf>,
+    },
+    Import {
+        source: Destination,
+        #[serde(default)]
+        patch_out: Option<std::path::PathBuf>,
+    },
+    Generate {
+        destination: Destination,
+        #[serde(default, rename = "where")]
+        filter: Option<Expression>,
         #[serde(default)]
         patch_out: Option<std::path::PathBuf>,
     },
@@ -81,8 +95,9 @@ pub struct UnknownMatch {
 #[derive(Clone, Debug, Serialize)]
 pub struct Selection {
     pub links: Vec<Link>,
+    pub origins: Vec<Origin>,
+    pub observations: BTreeMap<String, Observation>,
     pub undetermined: Vec<UnknownMatch>,
-    pub conflicts: Vec<Conflict>,
     pub complete: bool,
     pub diagnostics: Vec<Diagnostic>,
 }
@@ -91,21 +106,21 @@ pub async fn select(engine: &mut Engine<'_>, filter: Option<&Expression>) -> Res
     if let Some(filter) = filter {
         filter.validate()?;
     }
-    let graph = graph::build(engine).await?;
+    let sidecar = engine.session.sidecar().await?.data.clone();
     let mut result = Selection {
         links: Vec::new(),
+        origins: Vec::new(),
+        observations: BTreeMap::new(),
         undetermined: Vec::new(),
-        conflicts: Vec::new(),
-        complete: graph.complete,
-        diagnostics: graph.diagnostics,
+        complete: true,
+        diagnostics: Vec::new(),
     };
-    for link in graph.links {
+    for link in sidecar.links {
         tokio::task::yield_now().await;
-        let matches = match filter {
+        match match filter {
             Some(filter) => filter.evaluate(engine, &link).await,
             None => Ok(true),
-        };
-        match matches {
+        } {
             Ok(true) => result.links.push(link),
             Ok(false) => {}
             Err(error) => result.undetermined.push(UnknownMatch {
@@ -114,18 +129,24 @@ pub async fn select(engine: &mut Engine<'_>, filter: Option<&Expression>) -> Res
             }),
         }
     }
-    let selected: BTreeSet<_> = result
+    let ids: BTreeSet<_> = result
         .links
         .iter()
-        .map(|link| &link.key)
-        .chain(result.undetermined.iter().map(|unknown| &unknown.link.key))
+        .map(|link| &link.id)
+        .chain(result.undetermined.iter().map(|item| &item.link.id))
         .collect();
-    result.conflicts = graph
-        .conflicts
+    result.origins = sidecar
+        .origins
         .into_iter()
-        .filter(|conflict| conflict.variants.iter().any(|key| selected.contains(key)))
+        .filter(|origin| ids.contains(&origin.link))
         .collect();
-    result.complete &= result.undetermined.is_empty();
+    for origin in &result.origins {
+        result
+            .observations
+            .entry(origin.observation.clone())
+            .or_insert_with(|| sidecar.observations[&origin.observation].clone());
+    }
+    result.complete = result.undetermined.is_empty();
     Ok(result)
 }
 
@@ -147,7 +168,7 @@ pub enum CheckStatus {
 
 #[derive(Debug, Serialize)]
 pub struct LinkFindings {
-    pub key: String,
+    pub id: String,
     pub extension: String,
     pub findings: Vec<CheckFinding>,
 }
@@ -157,6 +178,7 @@ pub struct CheckResult {
     pub valid: bool,
     pub selection: Selection,
     pub findings: Vec<LinkFindings>,
+    pub duplicates: Vec<[String; 2]>,
 }
 
 #[derive(Deserialize)]
@@ -168,37 +190,58 @@ struct CheckRegionInput {
     snapshot: Option<String>,
 }
 
-pub async fn check(engine: &mut Engine<'_>, filter: Option<&Expression>) -> Result<CheckResult> {
+pub async fn check(
+    engine: &mut Engine<'_>,
+    filter: Option<&Expression>,
+    inspect_duplicates: bool,
+) -> Result<CheckResult> {
     let mut selection = select(engine, filter).await?;
     let mut findings = Vec::new();
     let checkers = engine.session.workspace.config.checks.clone();
     for link in &selection.links {
+        let source = Endpoint::resolve(engine, link.source.clone()).await;
+        let target = match link
+            .reference
+            .target
+            .expand(&engine.session.workspace.config.names)
+        {
+            Ok(selector) => Endpoint::resolve(engine, selector).await,
+            Err(error) => Endpoint::Unresolved {
+                selector: None,
+                error: format!("{error:#}"),
+            },
+        };
         let mut endpoints = Vec::new();
-        for (name, endpoint) in [("source", &link.source), ("target", &link.target)] {
+        for (name, endpoint) in [("source", &source), ("target", &target)] {
             match endpoint {
                 Endpoint::Resolved { .. } => endpoints.push(CheckFinding {
                     code: format!("{name}_resolved"),
                     message: format!("{name} resolved"),
                     status: CheckStatus::Pass,
                 }),
-                Endpoint::Unresolved { error, .. } => endpoints.push(CheckFinding {
-                    code: format!("{name}_unresolved"),
-                    message: error.clone(),
-                    status: CheckStatus::Fail,
-                }),
+                Endpoint::Unresolved { error, .. } => {
+                    selection.diagnostics.push(Diagnostic {
+                        stage: "resolve".into(),
+                        subject: format!("{}:{name}", link.id),
+                        message: error.clone(),
+                    });
+                }
             }
         }
         findings.push(LinkFindings {
-            key: link.key.clone(),
+            id: link.id.clone(),
             extension: "core".into(),
             findings: endpoints,
         });
+        if source.region().is_err() || target.region().is_err() {
+            continue;
+        }
         for checker in &checkers {
             let result = (async {
                 let plan: Vec<CheckRegionInput> = serde_json::from_value(engine.call(
                     &checker.extension,
                     "check_plan",
-                    json!({"link": link.extension_input(), "options": checker.options}),
+                    json!({"link": link, "source": source, "target": target, "options": checker.options}),
                 ).await?)
                 .context("invalid check_plan response")?;
                 let mut regions = BTreeMap::new();
@@ -228,27 +271,64 @@ pub async fn check(engine: &mut Engine<'_>, filter: Option<&Expression>) -> Resu
                 serde_json::from_value(engine.call(
                     &checker.extension,
                     "check",
-                    json!({"link": link.extension_input(), "options": checker.options, "regions": regions}),
+                    json!({"link": link, "source": source, "target": target, "options": checker.options, "regions": regions}),
                 ).await?)
                 .context("invalid check response")
             }).await;
             match result {
                 Ok(result) => findings.push(LinkFindings {
-                    key: link.key.clone(),
+                    id: link.id.clone(),
                     extension: checker.extension.clone(),
                     findings: result,
                 }),
                 Err(error) => selection.diagnostics.push(Diagnostic {
                     stage: "check".into(),
-                    subject: format!("{}:{}", checker.extension, link.key),
+                    subject: format!("{}:{}", checker.extension, link.id),
                     message: format!("{error:#}"),
                 }),
             }
         }
     }
+    let mut duplicates = Vec::new();
+    if inspect_duplicates {
+        let all = engine.session.sidecar().await?.data.links.clone();
+        let selected: BTreeSet<_> = selection.links.iter().map(|link| &link.id).collect();
+        for (index, left) in all.iter().enumerate() {
+            for right in &all[index + 1..] {
+                if !(selected.contains(&left.id) || selected.contains(&right.id))
+                    || left.annotation != right.annotation
+                {
+                    continue;
+                }
+                let same = async {
+                    let left_source = engine.resolve(&left.source).await?;
+                    let right_source = engine.resolve(&right.source).await?;
+                    if engine.compare(&left_source, &right_source).await? != Relation::Equal {
+                        return Ok::<_, anyhow::Error>(false);
+                    }
+                    let names = &engine.session.workspace.config.names;
+                    let left_target = left.reference.target.expand(names)?;
+                    let right_target = right.reference.target.expand(names)?;
+                    let left_target = engine.resolve(&left_target).await?;
+                    let right_target = engine.resolve(&right_target).await?;
+                    Ok(engine.compare(&left_target, &right_target).await? == Relation::Equal)
+                }
+                .await;
+                match same {
+                    Ok(true) => duplicates.push([left.id.clone(), right.id.clone()]),
+                    Ok(false) => {}
+                    Err(error) => selection.diagnostics.push(Diagnostic {
+                        stage: "duplicate".into(),
+                        subject: format!("{}:{}", left.id, right.id),
+                        message: format!("{error:#}"),
+                    }),
+                }
+            }
+        }
+    }
     selection.complete &= selection.diagnostics.is_empty();
     let valid = selection.complete
-        && selection.conflicts.is_empty()
+        && duplicates.is_empty()
         && findings.iter().all(|group| {
             group
                 .findings
@@ -259,6 +339,7 @@ pub async fn check(engine: &mut Engine<'_>, filter: Option<&Expression>) -> Resu
         valid,
         selection,
         findings,
+        duplicates,
     })
 }
 
@@ -318,8 +399,8 @@ pub async fn execute(
                     if complete { 0 } else { 2 },
                 )
             }
-            Operation::Check { filter } => {
-                let checked = check(&mut engine, filter.as_ref()).await?;
+            Operation::Check { filter, duplicates } => {
+                let checked = check(&mut engine, filter.as_ref(), duplicates).await?;
                 let complete = checked.selection.complete;
                 let exit = if !complete {
                     2
@@ -346,23 +427,19 @@ pub async fn execute(
                 };
                 (serde_json::to_value(report)?, complete, exit)
             }
-            Operation::Edit {
-                destination,
-                change,
-                patch_out,
-            } => {
-                let patch = editing::prepare(&mut engine, &destination, &change).await?;
-                let data = if let Some(path) = patch_out {
-                    let path = engine.session.workspace.root.join(path);
-                    let mut bytes = serde_json::to_vec_pretty(&patch)?;
-                    bytes.push(b'\n');
-                    engine.session.workspace.publish_new(&path, &bytes, false).await
-                        .context("save patch (destination must not exist)")?;
-                    json!({"patch": patch, "path": path, "applied": false})
-                } else {
-                    json!({"patch": patch.id, "applied": true, "commit": editing::apply(&mut engine, &patch).await?})
-                };
-                (data, true, 0)
+            Operation::Edit { change, patch_out } => {
+                let patch = editing::prepare(&mut engine, change).await?;
+                (finish_edit(&mut engine, patch, patch_out).await?, true, 0)
+            }
+            Operation::Import { source, patch_out } => {
+                let patch = editing::prepare_import(&mut engine, &source).await?;
+                (finish_edit(&mut engine, patch, patch_out).await?, true, 0)
+            }
+            Operation::Generate { destination, filter, patch_out } => {
+                let selected = select(&mut engine, filter.as_ref()).await?;
+                ensure!(selected.complete, "cannot generate an undetermined selection: {}", serde_json::to_string(&selected.undetermined)?);
+                let patch = editing::prepare_generation(&mut engine, &destination, &selected.links).await?;
+                (finish_edit(&mut engine, patch, patch_out).await?, true, 0)
             }
             Operation::Apply { patch } => (
                 json!({"patch": patch.id, "applied": true, "commit": editing::apply(&mut engine, &patch).await?}),
@@ -400,5 +477,28 @@ pub async fn execute(
             response.snapshot = Some(snapshot);
             response
         }
+    }
+}
+
+async fn finish_edit(
+    engine: &mut Engine<'_>,
+    patch: Patch,
+    patch_out: Option<std::path::PathBuf>,
+) -> Result<Value> {
+    if let Some(path) = patch_out {
+        let path = engine.session.workspace.root.join(path);
+        let mut bytes = serde_json::to_vec_pretty(&patch)?;
+        bytes.push(b'\n');
+        engine
+            .session
+            .workspace
+            .publish_new(&path, &bytes, false)
+            .await
+            .context("save patch (destination must not exist)")?;
+        Ok(json!({"patch": patch, "path": path, "applied": false}))
+    } else {
+        Ok(
+            json!({"patch": patch.id, "applied": true, "commit": editing::apply(engine, &patch).await?}),
+        )
     }
 }
