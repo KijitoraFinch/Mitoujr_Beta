@@ -90,9 +90,11 @@ impl Patch {
                 sidecar,
                 replacement,
                 after_hash,
+                before,
                 ..
             } => {
                 sidecar.data.validate()?;
+                before.validate_metadata()?;
                 ensure!(
                     digest(replacement.bytes()) == *after_hash,
                     "patch replacement hash mismatch"
@@ -105,7 +107,7 @@ impl Patch {
         let mut patch = Self {
             version: 1,
             id: String::new(),
-            root: engine.session.snapshot.root.clone(),
+            root: engine.session.workspace.root.to_string_lossy().into_owned(),
             change,
         };
         patch.seal()?;
@@ -161,29 +163,10 @@ pub async fn prepare(engine: &mut Engine<'_>, change: Change) -> Result<Patch> {
     sidecar_patch(engine, before, after)
 }
 
-async fn interpret(
-    engine: &mut Engine<'_>,
-    extension: &str,
-    observation: &Observation,
-) -> Result<ImportResult> {
-    engine
-        .session
-        .workspace
-        .read_observation(observation)
-        .await?;
-    let result: ImportResult = serde_json::from_value(
-        engine
-            .call(
-                extension,
-                "import",
-                json!({
-                    "observation": observation,
-                    "content_path": engine.session.workspace.blob_path(observation)?,
-                }),
-            )
-            .await?,
-    )
-    .context("invalid import result")?;
+async fn interpret(engine: &mut Engine<'_>, extension: &str, input: Value) -> Result<ImportResult> {
+    let result: ImportResult =
+        serde_json::from_value(engine.call(extension, "import", input).await?)
+            .context("invalid import result")?;
     ensure!(
         result.diagnostics.is_empty(),
         "import was incomplete: {}",
@@ -200,7 +183,8 @@ pub async fn prepare_import(engine: &mut Engine<'_>, source: &Destination) -> Re
         "import Resource does not exist: {}",
         observation.resource
     );
-    let imported = interpret(engine, &source.extension, &observation).await?;
+    let input = engine.observation_input(&observation).await?;
+    let imported = interpret(engine, &source.extension, input).await?;
     let revision = engine.manifest(&source.extension).await?.revision;
     let mut after = before.data.clone();
     let mut links: BTreeMap<_, _> = after
@@ -266,9 +250,14 @@ pub async fn prepare_generation(
     struct Generated {
         bytes: Vec<u8>,
     }
-    let generated: Generated = serde_json::from_value(engine.call(&destination.extension, "generate", json!({
-        "observation": before, "content_path": engine.session.workspace.blob_path(&before)?, "links": links,
-    })).await?).context("invalid generate result")?;
+    let mut input = engine.observation_input(&before).await?;
+    input["links"] = serde_json::to_value(links)?;
+    let generated: Generated = serde_json::from_value(
+        engine
+            .call(&destination.extension, "generate", input)
+            .await?,
+    )
+    .context("invalid generate result")?;
     let proposed = Observation::new(
         before.resource.clone(),
         &generated.bytes,
@@ -279,12 +268,11 @@ pub async fn prepare_generation(
             revision: Value::Null,
         },
     );
-    engine
-        .session
-        .workspace
-        .save_observation(&proposed, &generated.bytes)
+    let input = engine
+        .host
+        .observation_input(&proposed, &generated.bytes)
         .await?;
-    let imported = interpret(engine, &destination.extension, &proposed).await?;
+    let imported = interpret(engine, &destination.extension, input).await?;
     let mut actual = Vec::new();
     for candidate in imported.links {
         actual.push(sidecar::normalize(&engine.session.workspace, candidate.link).await?);
@@ -313,30 +301,22 @@ pub async fn prepare_generation(
 pub async fn apply(engine: &mut Engine<'_>, patch: &Patch) -> Result<Value> {
     patch.validate()?;
     ensure!(
-        !engine.session.frozen,
-        "patch application requires current state; omit --snapshot"
-    );
-    ensure!(
-        patch.root == engine.session.snapshot.root,
+        patch.root == engine.session.workspace.root.to_string_lossy(),
         "patch belongs to a different workspace"
     );
     match &patch.change {
         PatchChange::Sidecar { before, after } => {
             sidecar::commit(&engine.session.workspace, before, after).await?;
-            engine.session.snapshot.sidecar = Some(before.clone());
-            let mut session = Session::new(engine.session.workspace.clone())?;
-            session.snapshot.observations = engine.session.snapshot.observations.clone();
-            session.snapshot.failures = engine.session.snapshot.failures.clone();
-            session.snapshot.resolution_reads = engine.session.snapshot.resolution_reads.clone();
-            let state = session.sidecar().await?.clone();
+            let state = sidecar::read(&engine.session.workspace).await?;
             ensure!(
                 state.data == *after,
                 "Sidecar changed after commit; inspect current state"
             );
-            Ok(
-                json!({"patch": patch.id, "sidecar": state.content_hash, "snapshot": session.save().await?}),
-            )
+            let content_hash = state.content_hash.clone();
+            engine.session.sidecar = Some(state);
+            Ok(json!({"patch": patch.id, "sidecar": content_hash}))
         }
+
         PatchChange::Resource {
             sidecar,
             provider_config_hash,
@@ -349,7 +329,7 @@ pub async fn apply(engine: &mut Engine<'_>, patch: &Patch) -> Result<Value> {
                     == sidecar.content_hash,
                 "Sidecar changed since generation was prepared"
             );
-            engine.session.snapshot.sidecar = Some(sidecar.clone());
+            engine.session.sidecar = Some(sidecar.clone());
             let config = engine
                 .session
                 .workspace
@@ -361,9 +341,8 @@ pub async fn apply(engine: &mut Engine<'_>, patch: &Patch) -> Result<Value> {
                 digest(&serde_json::to_vec(config)?) == *provider_config_hash,
                 "Resource provider configuration changed since the patch was prepared"
             );
-            engine.session.workspace.read_observation(before).await?;
             let mut current =
-                Engine::new(Session::new(engine.session.workspace.clone())?, engine.host)?;
+                Engine::new(Session::new(engine.session.workspace.clone()), engine.host)?;
             let observed = current.observe(&before.resource).await?;
             ensure!(
                 observed.provider == before.provider
@@ -389,16 +368,13 @@ pub async fn apply(engine: &mut Engine<'_>, patch: &Patch) -> Result<Value> {
                 "commit result does not confirm proposed content; inspect Resource state before retrying"
             );
             let mut after =
-                Engine::new(Session::new(engine.session.workspace.clone())?, engine.host)?;
+                Engine::new(Session::new(engine.session.workspace.clone()), engine.host)?;
             let observation = after.observe(&before.resource).await?;
             ensure!(
                 observation.content_hash == *after_hash && observation.state == committed.state,
                 "Resource does not match committed patch; inspect Resource state before retrying"
             );
-            after.session.snapshot.sidecar = Some(sidecar.clone());
-            Ok(
-                json!({"patch": patch.id, "resource": before.resource, "observation": observation, "snapshot": after.session.save().await?}),
-            )
+            Ok(json!({"patch": patch.id, "resource": before.resource, "observation": observation}))
         }
     }
 }

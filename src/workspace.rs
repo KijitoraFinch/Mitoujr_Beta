@@ -1,4 +1,4 @@
-use crate::model::{Observation, ResourceState, Snapshot, Target, digest, require_version};
+use crate::model::{Diagnostic, Observation, ResourceState, Target, require_version};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -34,7 +34,7 @@ pub struct CheckSpec {
 #[serde(deny_unknown_fields)]
 pub struct ProcessExtension {
     pub command: Vec<String>,
-    /// A version chosen by the extension author, retained in interpretation snapshots.
+    /// A version chosen by the extension author and checked against its manifest.
     pub revision: String,
     #[serde(default)]
     pub schemes: Vec<String>,
@@ -95,21 +95,6 @@ pub struct Workspace {
 
 impl Workspace {
     pub async fn open(root: &Path) -> Result<Self> {
-        let workspace = Self::for_replay(root).await?;
-        let root = workspace.root;
-        let config_path = root.join("monika.json");
-        let config = match fs::read(&config_path).await {
-            Ok(bytes) => serde_json::from_slice::<Config>(&bytes).context("parse monika.json")?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
-            Err(error) => return Err(error).context("read monika.json"),
-        };
-        config.validate()?;
-        Ok(Self { root, config })
-    }
-
-    /// Replay obtains its configuration from the snapshot, independently of
-    /// the current monika.json (which may have changed or be under editing).
-    pub async fn for_replay(root: &Path) -> Result<Self> {
         let root = fs::canonicalize(root)
             .await
             .with_context(|| format!("open workspace {}", root.display()))?;
@@ -118,10 +103,14 @@ impl Workspace {
             "workspace is not a directory: {}",
             root.display()
         );
-        Ok(Self {
-            root,
-            config: Config::default(),
-        })
+        let config_path = root.join("monika.json");
+        let config = match fs::read(&config_path).await {
+            Ok(bytes) => serde_json::from_slice::<Config>(&bytes).context("parse monika.json")?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Config::default(),
+            Err(error) => return Err(error).context("read monika.json"),
+        };
+        config.validate()?;
+        Ok(Self { root, config })
     }
 
     pub async fn discover(start: &Path) -> Result<Self> {
@@ -157,7 +146,7 @@ impl Workspace {
             content_hash: None,
             data: crate::sidecar::Sidecar::default(),
         };
-        self.publish_new(&path, &bytes, false).await?;
+        self.publish_new(&path, &bytes).await?;
         let mut initial = sidecar.data.clone();
         initial.revision = 1;
         crate::sidecar::commit(self, &sidecar, &initial).await?;
@@ -220,32 +209,8 @@ impl Workspace {
             .map_err(|_| anyhow::anyhow!("not a local file resource: {resource}"))
     }
 
-    async fn store_dir(&self, kind: &str) -> Result<PathBuf> {
-        let path = self.root.join(".monika").join(kind);
-        fs::create_dir_all(&path)
-            .await
-            .with_context(|| format!("create {}", path.display()))?;
-        Ok(path)
-    }
-
-    fn store_path(&self, kind: &str, id: &str) -> Result<PathBuf> {
-        ensure!(
-            id.len() == 64
-                && id
-                    .bytes()
-                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
-            "invalid object ID: {id}"
-        );
-        Ok(self.root.join(".monika").join(kind).join(id))
-    }
-
-    /// Publish only fully written immutable objects. Existing content is verified.
-    pub(crate) async fn publish_new(
-        &self,
-        path: &Path,
-        bytes: &[u8],
-        allow_identical: bool,
-    ) -> Result<()> {
+    /// Publish a fully written file without replacing an existing destination.
+    pub(crate) async fn publish_new(&self, path: &Path, bytes: &[u8]) -> Result<()> {
         let parent = path.parent().context("object has no parent directory")?;
         let staged = tempfile::NamedTempFile::new_in(parent)?;
         let mut output = fs::File::from_std(staged.reopen()?);
@@ -253,87 +218,11 @@ impl Workspace {
         output.sync_all().await?;
         drop(output);
         let destination = path.to_owned();
-        match tokio::task::spawn_blocking(move || staged.persist_noclobber(destination)).await? {
-            Ok(_) => Ok(()),
-            Err(error)
-                if error.error.kind() == std::io::ErrorKind::AlreadyExists && allow_identical =>
-            {
-                ensure!(
-                    fs::read(path).await? == bytes,
-                    "stored object is corrupt: {}",
-                    path.display()
-                );
-                Ok(())
-            }
-            Err(error) => Err(error.error).with_context(|| format!("write {}", path.display())),
-        }
-    }
-
-    pub async fn save_observation(&self, observation: &Observation, bytes: &[u8]) -> Result<()> {
-        observation.verify(bytes)?;
-        let dir = self.store_dir("blobs").await?;
-        self.publish_new(&dir.join(&observation.content_hash), bytes, true)
-            .await
-    }
-
-    pub async fn read_observation(&self, observation: &Observation) -> Result<Vec<u8>> {
-        let bytes = fs::read(self.store_path("blobs", &observation.content_hash)?)
-            .await
-            .with_context(|| format!("read saved observation {}", observation.id))?;
-        observation.verify(&bytes)?;
-        Ok(bytes)
-    }
-
-    pub fn blob_path(&self, observation: &Observation) -> Result<PathBuf> {
-        self.store_path("blobs", &observation.content_hash)
-    }
-
-    pub async fn save_snapshot(&self, snapshot: &Snapshot) -> Result<String> {
-        let bytes = serde_json::to_vec(snapshot)?;
-        let id = digest(&bytes);
-        let dir = self.store_dir("snapshots").await?;
-        self.publish_new(&dir.join(&id), &bytes, true).await?;
-        Ok(id)
-    }
-
-    pub async fn read_snapshot(&self, id: &str) -> Result<Snapshot> {
-        let bytes = fs::read(self.store_path("snapshots", id)?)
-            .await
-            .with_context(|| format!("read snapshot {id}"))?;
-        ensure!(digest(&bytes) == id, "corrupt snapshot {id}");
-        let snapshot: Snapshot = serde_json::from_slice(&bytes)?;
-        require_version(snapshot.version)?;
-        ensure!(
-            snapshot.interpreter == env!("CARGO_PKG_VERSION"),
-            "snapshot uses a different Monika interpreter version"
-        );
-        ensure!(
-            snapshot.root == self.root.to_string_lossy(),
-            "snapshot belongs to a different workspace"
-        );
-        if let Some(sidecar) = &snapshot.sidecar {
-            sidecar.data.validate()?;
-        }
-        for (resource, observation) in &snapshot.observations {
-            ensure!(
-                resource == &observation.resource,
-                "snapshot resource mismatch"
-            );
-            ensure!(
-                !snapshot.failures.contains_key(resource),
-                "snapshot has both success and failure for {resource}"
-            );
-        }
-        for resources in snapshot.resolution_reads.values() {
-            for resource in resources {
-                ensure!(
-                    snapshot.observations.contains_key(resource)
-                        || snapshot.failures.contains_key(resource),
-                    "resolution refers to an unrecorded resource: {resource}"
-                );
-            }
-        }
-        Ok(snapshot)
+        tokio::task::spawn_blocking(move || staged.persist_noclobber(destination))
+            .await?
+            .map_err(|error| error.error)
+            .with_context(|| format!("write {}", path.display()))?;
+        Ok(())
     }
 }
 
@@ -347,89 +236,47 @@ pub fn timestamp() -> String {
 
 pub struct Session {
     pub workspace: Workspace,
-    pub snapshot: Snapshot,
-    pub frozen: bool,
+    pub observations: BTreeMap<String, Observation>,
+    pub failures: BTreeMap<String, Diagnostic>,
+    pub(crate) sidecar: Option<crate::sidecar::SidecarState>,
     bytes: BTreeMap<String, Vec<u8>>,
 }
 
 impl Session {
-    pub fn new(workspace: Workspace) -> Result<Self> {
-        let snapshot = Snapshot {
-            version: 1,
-            interpreter: env!("CARGO_PKG_VERSION").into(),
-            created_at: timestamp(),
-            root: workspace.root.to_string_lossy().into_owned(),
-            interpretation: serde_json::to_value(&workspace.config)?,
+    pub fn new(workspace: Workspace) -> Self {
+        Self {
+            workspace,
             observations: BTreeMap::new(),
             failures: BTreeMap::new(),
             sidecar: None,
-            resolution_reads: BTreeMap::new(),
-        };
-        Ok(Self {
-            workspace,
-            snapshot,
-            frozen: false,
             bytes: BTreeMap::new(),
-        })
+        }
     }
 
-    pub async fn replay(mut workspace: Workspace, id: &str) -> Result<Self> {
-        let snapshot = workspace.read_snapshot(id).await?;
-        workspace.config = serde_json::from_value(snapshot.interpretation.clone())
-            .context("invalid saved interpretation")?;
-        workspace.config.validate()?;
-        Ok(Self {
-            workspace,
-            snapshot,
-            frozen: true,
-            bytes: BTreeMap::new(),
-        })
-    }
-
-    pub async fn record(
+    pub fn record(
         &mut self,
         resource: String,
         bytes: Vec<u8>,
         provider: String,
         state: ResourceState,
     ) -> Result<Observation> {
-        ensure!(!self.frozen, "cannot add observations to a saved snapshot");
         ensure!(
-            !self.snapshot.observations.contains_key(&resource)
-                && !self.snapshot.failures.contains_key(&resource),
+            !self.observations.contains_key(&resource) && !self.failures.contains_key(&resource),
             "resource already observed: {resource}"
         );
         let observation = Observation::new(resource.clone(), &bytes, timestamp(), provider, state);
-        self.workspace
-            .save_observation(&observation, &bytes)
-            .await?;
+        observation.verify(&bytes)?;
         self.bytes.insert(observation.id.clone(), bytes);
-        self.snapshot
-            .observations
-            .insert(resource, observation.clone());
+        self.observations.insert(resource, observation.clone());
         Ok(observation)
     }
 
-    pub async fn bytes(&mut self, observation: &Observation) -> Result<&[u8]> {
+    pub fn bytes(&self, observation: &Observation) -> Result<&[u8]> {
         ensure!(
-            self.snapshot.observations.get(&observation.resource) == Some(observation),
+            self.observations.get(&observation.resource) == Some(observation),
             "observation is not in this session"
         );
-        if !self.bytes.contains_key(&observation.id) {
-            self.bytes.insert(
-                observation.id.clone(),
-                self.workspace.read_observation(observation).await?,
-            );
-        }
         Ok(&self.bytes[&observation.id])
-    }
-
-    pub async fn text(&mut self, observation: &Observation) -> Result<&str> {
-        std::str::from_utf8(self.bytes(observation).await?).context("resource is not UTF-8 text")
-    }
-
-    pub async fn save(&self) -> Result<String> {
-        self.workspace.save_snapshot(&self.snapshot).await
     }
 }
 
@@ -483,21 +330,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stored_observations_are_immutable_and_corruption_is_detected() -> Result<()> {
+    async fn observations_are_fixed_inputs_owned_by_the_session() -> Result<()> {
         let state = || ResourceState {
             exists: true,
             revision: serde_json::Value::Null,
         };
         let dir = tempfile::tempdir()?;
-        let mut session = Session::new(Workspace::open(dir.path()).await?)?;
-        let observed = session
-            .record(
-                "example:resource".into(),
-                b"old".to_vec(),
-                "example".into(),
-                state(),
-            )
-            .await?;
+        let workspace = Workspace::open(dir.path()).await?;
+        let mut session = Session::new(workspace.clone());
+        let observed = session.record(
+            "example:resource".into(),
+            b"old".to_vec(),
+            "example".into(),
+            state(),
+        )?;
         assert!(
             session
                 .record(
@@ -506,33 +352,35 @@ mod tests {
                     "example".into(),
                     state()
                 )
-                .await
                 .is_err()
         );
-        let snapshot = session.save().await?;
-        let mut replay = Session::replay(Workspace::open(dir.path()).await?, &snapshot).await?;
-        assert_eq!(replay.bytes(&observed).await?, b"old");
+        assert_eq!(session.bytes(&observed)?, b"old");
+        let mut invalid = observed.clone();
+        invalid.size += 1;
+        assert!(session.bytes(&invalid).is_err());
         assert!(
-            replay
-                .record("example:new".into(), vec![], "example".into(), state())
-                .await
+            session
+                .record(
+                    "example:absent".into(),
+                    b"unexpected".to_vec(),
+                    "example".into(),
+                    ResourceState {
+                        exists: false,
+                        revision: serde_json::Value::Null
+                    }
+                )
                 .is_err()
         );
-        fs::write(
-            replay
-                .workspace
-                .store_path("blobs", &observed.content_hash)?,
-            "tampered",
-        )
-        .await?;
-        assert!(replay.workspace.read_observation(&observed).await.is_err());
-        assert!(
-            replay
-                .workspace
-                .read_snapshot("../../escape")
-                .await
-                .is_err()
-        );
+        let mut next = Session::new(workspace);
+        assert!(next.bytes(&observed).is_err());
+        let current = next.record(
+            "example:resource".into(),
+            b"new".to_vec(),
+            "example".into(),
+            state(),
+        )?;
+        assert_eq!(next.bytes(&current)?, b"new");
+        assert!(!dir.path().join(".monika").exists());
         Ok(())
     }
 }

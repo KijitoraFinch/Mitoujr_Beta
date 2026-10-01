@@ -12,7 +12,6 @@ use url::Url;
 pub struct Engine<'host> {
     pub session: Session,
     manifests: BTreeMap<String, Manifest>,
-    resolutions: BTreeMap<String, std::result::Result<Region, String>>,
     pub(crate) host: &'host mut process::Host,
     failed_manifests: BTreeMap<String, String>,
 }
@@ -32,7 +31,6 @@ impl<'host> Engine<'host> {
         Ok(Self {
             session,
             manifests,
-            resolutions: BTreeMap::new(),
             host,
             failed_manifests: BTreeMap::new(),
         })
@@ -98,16 +96,12 @@ impl<'host> Engine<'host> {
 
     pub async fn observe(&mut self, resource: &str) -> Result<Observation> {
         let resource = self.session.workspace.resource(resource).await?;
-        if let Some(observation) = self.session.snapshot.observations.get(&resource) {
+        if let Some(observation) = self.session.observations.get(&resource) {
             return Ok(observation.clone());
         }
-        if let Some(failure) = self.session.snapshot.failures.get(&resource) {
+        if let Some(failure) = self.session.failures.get(&resource) {
             bail!("{}", failure.message);
         }
-        ensure!(
-            !self.session.frozen,
-            "resource was not observed in this snapshot: {resource}"
-        );
         let url = Url::parse(&resource)?;
         let result = (async {
             let name = self
@@ -139,11 +133,10 @@ impl<'host> Engine<'host> {
                 serde_json::from_value(result).context("invalid observe result")?;
             self.session
                 .record(resource.clone(), result.bytes, name, result.state)
-                .await
         })
         .await;
         if let Err(error) = &result {
-            self.session.snapshot.failures.insert(
+            self.session.failures.insert(
                 resource.clone(),
                 Diagnostic {
                     stage: "observe".into(),
@@ -156,34 +149,18 @@ impl<'host> Engine<'host> {
     }
 
     pub async fn observation_input(&mut self, observation: &Observation) -> Result<Value> {
-        self.session.bytes(observation).await?;
-        Ok(
-            json!({"observation": observation, "content_path": self.session.workspace.blob_path(observation)?}),
-        )
+        let bytes = self.session.bytes(observation)?;
+        self.host.observation_input(observation, bytes).await
     }
 
     pub async fn resolve(&mut self, selector: &RegionSelector) -> Result<Region> {
-        let key = serde_json::to_string(&selector)?;
-        if let Some(result) = self.resolutions.get(&key) {
-            return result.clone().map_err(anyhow::Error::msg);
-        }
-        let result = self
-            .resolve_uncached(selector)
-            .await
-            .map_err(|error| format!("{error:#}"));
-        self.resolutions.insert(key, result.clone());
-        result.map_err(anyhow::Error::msg)
-    }
-
-    pub(crate) async fn resolve_uncached(&mut self, selector: &RegionSelector) -> Result<Region> {
         let manifest = self.manifest(&selector.extension).await?;
         ensure!(
             manifest.supports("resolve"),
             "extension {} does not resolve regions",
             selector.extension
         );
-        let key = serde_json::to_string(selector)?;
-        let mut scope = ReadScope::new(self.session.snapshot.resolution_reads.get(&key).cloned());
+        let mut scope = ReadScope::default();
         let config = self.session.workspace.config.extensions[&selector.extension].clone();
         // This deadline covers the whole interpretation, including nested reads
         // served by other processes. A sequence of reads cannot reset it.
@@ -192,11 +169,6 @@ impl<'host> Engine<'host> {
             self.resolve_with_reads(selector, &mut scope),
         )
         .await;
-        self.session
-            .snapshot
-            .resolution_reads
-            .entry(key)
-            .or_insert_with(|| scope.resources.clone());
         let result = match result {
             Ok(result) => result?,
             Err(_) => {

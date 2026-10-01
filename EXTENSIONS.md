@@ -4,8 +4,8 @@ Link と注釈は Core が Sidecar に保存する。外部拡張は Resource �
 Region の比較、注釈の検査、Link の取り込み・生成を提供する。
 
 拡張は、JSON LinesでCoreと通信する独立した実行プログラム。
-CLIの一回の実行中は、プロジェクトルート・拡張名・登録設定が同じプロセスを、
-過去の Observation や書き込み後の Observation を扱う場合も再利用する。各メッセージを標準入力・標準出力の
+CLIの一回の実行中は、プロジェクトルート・拡張名・登録設定が同じプロセスを再利用する。
+各メッセージを標準入力・標準出力の
 JSON一行でやり取りし、送信時にflushする。ログは標準エラーへ出力する。
 
 Observation を解釈の基礎とし、解決・比較では LS やプロジェクト設定などの外部状態も利用できる。
@@ -96,21 +96,22 @@ timeoutは入力送信から応答取得までの全体に適用する。不正�
 ```
 
 存在しない Resource は `bytes:[]`、`state.exists:false` を返す。
-認証失敗や取得失敗は `error` を返す。不存在と取得失敗は別の状態として保存する。
+認証失敗や取得失敗は `error` を返す。Core は不存在と取得失敗を区別する。
 `revision` は任意のJSON値で、提供元が条件付き書き込みのために使う情報を保持できる。
 
-Coreは内容を固定して保存し、Observation を作る。
+Coreは内容を固定して操作中に保持し、Observation を作る。
 Observation には `id`・`resource`・`content_hash`・`size`・`observed_at`・`provider`・`state` がある。
 `observed_at` はUnix epochからのnanosecondsの文字列。
-同じ Resource は一つのsessionで一度観測し、以後は保存した状態を使う。
+同じ Resource は操作中に一度観測し、以後はその Observation を使う。書き込み時の照合と適用後の確認は独立して観測する。
 
 解釈操作に渡す Observation は次の形になる。
 
 ```json
-{"observation":{"id":"...","resource":"...","content_hash":"...","size":3,"observed_at":"...","provider":"sets","state":{"exists":true,"revision":"..."}},"content_path":"/project/.monika/blobs/..."}
+{"observation":{"id":"...","resource":"...","content_hash":"...","size":3,"observed_at":"...","provider":"sets","state":{"exists":true,"revision":"..."}},"content_path":"/tmp/monika-observation-..."}
 ```
 
 拡張は `content_path` から固定済みのbytesを読む。このファイルは読み取り専用の入力として扱う。
+Core は拡張プロセスの終了までファイルを保持し、その後に削除する。
 Coreが内容のhashを検証し、大きな内容を呼び出しごとにJSONへ埋め直す必要をなくしている。
 解釈する対象はこの Observation の内容に対応させる。LS を使う場合も、対象の内容を合わせて扱う。
 LS などが使う関連ファイルや設定は、Observation として取得していなくても参照できる。
@@ -136,7 +137,7 @@ Core は RegionSelector の `query` を解釈せず、指定された拡張へ�
 ```
 
 ```json
-{"protocol":1,"id":2,"read_result":[{"observation":{"id":"...","resource":"file:///project/a.json","content_hash":"...","size":3,"observed_at":"...","provider":"sets","state":{"exists":true,"revision":"..."}},"content_path":"/project/.monika/blobs/..."}]}
+{"protocol":1,"id":2,"read_result":[{"observation":{"id":"...","resource":"file:///project/a.json","content_hash":"...","size":3,"observed_at":"...","provider":"sets","state":{"exists":true,"revision":"..."}},"content_path":"/tmp/monika-observation-..."}]}
 ```
 
 Coreは要求された Observation だけを渡す。取得済みの Resource にはそのセッションの Observation を使い、
@@ -179,12 +180,11 @@ Coreが読み取りを記録し、完成した Region に `observations` とし�
 `show` は `content` を表示する。文字列なら本文、それ以外ならJSONとして表示する。
 
 キャッシュした計算結果を使う場合も、結果に用いる Observation は各解決で `read` により取得する。
-同じ URI でも操作や保存済み入力が変われば Observation が変わるので、返された情報を使って再利用を判断する。
+同じ URI でも操作ごとに Observation が変わるので、返された情報を使って再利用を判断する。
 取得済みの Observation を返す際に Core が Resource を再観測することはない。
 キャッシュにより不要になった探索など、観測要求の集合は呼び出しごとに変わってよい。
 
-現行の `--snapshot` が復元するのは Core が保存した Observation・Sidecar・設定である。
-拡張の外部状態は拡張自身が扱う。設計への変更点は [実装との差分](IMPLEMENTATION.md#設計との差分) に記載する。
+履歴は VCS や Resource の提供元が管理する。Core は履歴用に Observation を保存しない。
 
 `compare` のinputは `{"left":Region,"right":Region}`。
 返す値は `"equal"`・`"contains"`・`"within"`・`"incomparable"` のいずれか。
@@ -244,14 +244,12 @@ Link の注釈は `link.annotation`、両端の Region は `source.region` / `ta
 `check_plan` は追加で必要な Region の配列を返す。
 
 ```json
-[{"name":"baseline","target":{"extension":"sets","resource":"rows.json","query":"2"},"snapshot":"saved-snapshot-id"}]
+[{"name":"baseline","target":{"extension":"sets","resource":"baseline.json","query":"2"}}]
 ```
 
-`snapshot` を省略した場合は現在の観測、指定した場合はその保存済み Observation を使う。
-名前付きtargetは、それぞれのsnapshot の設定で展開する。
+Core は同じ操作内の Observation を使って解決し、名前付き target は現在の設定で展開する。
 追加の Region が不要なら `[]` を返す。
 Coreが Region を解決して `check` のinputに `regions:{"baseline":Region}` を加える。
-外部状態の扱いは、前述の `--snapshot` と同じである。
 
 `check` は判定の配列を返す。
 
@@ -298,7 +296,7 @@ Coreはさらに独立した観測で内容と状態を確認する。応答の�
 ## CLIと同じJSON操作
 
 `monika request` は次の形のオブジェクトを一つ読み、[READMEの応答形式](README.md#observation-と結果)で返す。
-`--root`・`--snapshot` は通常のCLIと共通。
+`--root` は通常のCLIと共通。
 
 | op | 追加のフィールド |
 | --- | --- |

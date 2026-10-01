@@ -164,47 +164,40 @@ fn conditions_preserve_unknown_matches_and_boolean_dominance() -> Result<()> {
 }
 
 #[test]
-fn cli_and_json_requests_share_operations_and_snapshots_survive_live_changes() -> Result<()> {
+fn cli_and_json_requests_resolve_current_state_without_history() -> Result<()> {
     let dir = setup()?;
     let (code, shown) = run(dir.path(), &["show", "sets:rows.json#2"], None)?;
     assert_eq!(code, 0, "{shown}");
     assert_eq!(shown["data"]["region"]["content"]["count"], 2);
-    let snapshot = shown["snapshot"].as_str().unwrap();
+    for id in shown["data"]["region"]["observations"].as_array().unwrap() {
+        assert_eq!(shown["observations"][id.as_str().unwrap()]["id"], *id);
+    }
+    assert!(shown.get("snapshot").is_none());
     fs::write(dir.path().join("rows.json"), "[0]")?;
-    let (code, replay) = run(
+    let (code, latest) = run(
         dir.path(),
-        &["--snapshot", snapshot, "request"],
+        &["request"],
         Some(&json!({"op":"show","target":selector("rows.json",2)})),
     )?;
-    assert_eq!(code, 0, "{replay}");
-    assert_eq!(replay["data"], shown["data"]);
-    let (code, latest) = run(dir.path(), &["show", "sets:rows.json#2"], None)?;
     assert_eq!(code, 0, "{latest}");
     assert_eq!(latest["data"]["region"]["content"]["count"], 0);
+    assert!(!dir.path().join(".monika").exists());
     fs::write(
         dir.path().join("monika.json"),
         "configuration under editing",
     )?;
-    let (code, saved_config) = run(
-        dir.path(),
-        &["--snapshot", snapshot, "show", "sets:rows.json#2"],
-        None,
-    )?;
-    assert_eq!(code, 0, "{saved_config}");
-    assert_eq!(saved_config["data"], shown["data"]);
+    assert_eq!(run(dir.path(), &["show", "sets:rows.json#2"], None)?.0, 2);
     Ok(())
 }
 
 #[test]
-fn annotation_checker_uses_saved_baseline_and_reports_changed_content() -> Result<()> {
+fn annotation_checker_resolves_additional_current_inputs() -> Result<()> {
     let dir = setup()?;
-    let (_, shown) = run(dir.path(), &["show", "sets:rows.json#2"], None)?;
+    fs::write(dir.path().join("baseline.json"), "[1,2,3]")?;
     let declaration = link(
         "baseline",
         2,
-        json!({"baseline":{
-            "snapshot":shown["snapshot"],"target":selector("rows.json",2)
-        }}),
+        json!({"baseline":{"target":selector("baseline.json",2)}}),
     );
     add(dir.path(), &declaration)?;
     let (code, checked) = run(dir.path(), &["check"], None)?;
@@ -216,6 +209,128 @@ fn annotation_checker_uses_saved_baseline_and_reports_changed_content() -> Resul
         checked["data"]["findings"][1]["findings"][0]["status"],
         "fail"
     );
+    Ok(())
+}
+
+#[test]
+fn history_requests_are_rejected_by_cli_json_and_check_plan() -> Result<()> {
+    let dir = setup()?;
+    let (code, rejected) = run(dir.path(), &["--snapshot", "old", "show", "@all"], None)?;
+    assert_eq!(code, 2, "{rejected}");
+    assert!(rejected["error"].as_str().unwrap().contains("--snapshot"));
+    let (code, rejected) = run(
+        dir.path(),
+        &["request"],
+        Some(&json!({"op":"show", "target":selector("rows.json",0), "snapshot":"old"})),
+    )?;
+    assert_eq!(code, 2, "{rejected}");
+    assert!(
+        rejected["error"]
+            .as_str()
+            .unwrap()
+            .contains("unknown field `snapshot`")
+    );
+    add(
+        dir.path(),
+        &link(
+            "old",
+            2,
+            json!({
+                "baseline":{"target":selector("rows.json",2),"snapshot":"old"}
+            }),
+        ),
+    )?;
+    let (code, rejected) = run(dir.path(), &["check"], None)?;
+    assert_eq!(code, 2, "{rejected}");
+    assert!(rejected.to_string().contains("unknown field `snapshot`"));
+    Ok(())
+}
+
+#[test]
+fn saved_import_patch_needs_only_its_contents_and_current_sidecar() -> Result<()> {
+    let dir = setup()?;
+    fs::write(
+        dir.path().join("input.links"),
+        serde_json::to_vec(&json!({
+            "links":[link("imported", 2, json!({"keep":[null,true]}))]
+        }))?,
+    )?;
+    let (code, prepared) = run(
+        dir.path(),
+        &[
+            "import",
+            "input.links",
+            "--extension",
+            "sets",
+            "--patch-out",
+            "import.json",
+        ],
+        None,
+    )?;
+    assert_eq!(code, 0, "{prepared}");
+    assert!(!dir.path().join(".monika").exists());
+    fs::remove_file(dir.path().join("input.links"))?;
+    // Applying a Sidecar patch also works without the original interpreter/provider.
+    fs::write(dir.path().join("monika.json"), r#"{"version":1}"#)?;
+    let (code, applied) = run(dir.path(), &["apply", "import.json"], None)?;
+    assert_eq!(code, 0, "{applied}");
+    let sidecar = stored(dir.path())?;
+    assert_eq!(
+        sidecar["links"][0]["annotation"],
+        json!({"keep":[null,true]})
+    );
+    assert_eq!(sidecar["origins"].as_array().unwrap().len(), 1);
+    assert_eq!(sidecar["observations"].as_object().unwrap().len(), 1);
+    assert!(!dir.path().join(".monika").exists());
+    Ok(())
+}
+
+#[test]
+fn saved_generation_patches_apply_text_and_binary_without_observation_storage() -> Result<()> {
+    for extension in ["sets", "binary"] {
+        for exists in [false, true] {
+            let dir = setup()?;
+            add(dir.path(), &link("one", 2, json!({"keep":[null,"日本語"]})))?;
+            configure_variant(dir.path(), extension)?;
+            let destination = dir.path().join("out.links");
+            if exists {
+                fs::write(&destination, b"\xff\0previous content")?;
+            }
+            let (code, prepared) = run(
+                dir.path(),
+                &[
+                    "generate",
+                    "out.links",
+                    "--extension",
+                    extension,
+                    "--patch-out",
+                    "generate.json",
+                ],
+                None,
+            )?;
+            assert_eq!(code, 0, "{prepared}");
+            assert!(!dir.path().join(".monika").exists());
+            // Disposable state from any earlier operation is irrelevant to apply.
+            fs::create_dir(dir.path().join(".monika"))?;
+            fs::write(dir.path().join(".monika/cache"), b"discardable")?;
+            fs::remove_dir_all(dir.path().join(".monika"))?;
+            let (code, applied) = run(dir.path(), &["apply", "generate.json"], None)?;
+            assert_eq!(code, 0, "{applied}");
+            let output = fs::read(destination)?;
+            assert_eq!(
+                applied["data"]["commit"]["observation"]["content_hash"],
+                monika::model::digest(&output)
+            );
+            let json = if extension == "binary" {
+                assert!(output.starts_with(b"\xff\0"));
+                &output[2..]
+            } else {
+                &output
+            };
+            let document: Value = serde_json::from_slice(json)?;
+            assert_eq!(document["links"], stored(dir.path())?["links"]);
+        }
+    }
     Ok(())
 }
 
@@ -274,6 +389,9 @@ fn core_owns_links_without_extensions_and_cache_deletion_preserves_authority() -
     let (code, listed) = run(dir.path(), &["links"], None)?;
     assert_eq!(code, 0, "{listed}");
     assert_eq!(listed["data"]["links"], data["links"]);
+    assert!(!dir.path().join(".monika").exists());
+    fs::create_dir_all(dir.path().join(".monika"))?;
+    fs::write(dir.path().join(".monika/arbitrary-cache"), b"cached")?;
     fs::remove_dir_all(dir.path().join(".monika"))?;
     let (code, rebuilt) = run(dir.path(), &["links"], None)?;
     assert_eq!(code, 0, "{rebuilt}");
@@ -330,23 +448,20 @@ fn normalization_rejects_duplicate_ids_definitions_and_unknown_named_targets() -
 }
 
 #[test]
-fn sidecar_snapshots_ignore_later_edits_and_unrelated_external_files() -> Result<()> {
+fn sidecar_queries_read_current_authority_and_ignore_unrelated_files() -> Result<()> {
     let dir = setup()?;
     add(dir.path(), &link("one", 0, json!("original")))?;
     fs::write(dir.path().join("unrelated.links"), "this is not JSON")?;
     let (code, before) = run(dir.path(), &["links"], None)?;
     assert_eq!(code, 0, "{before}");
-    let snapshot = before["snapshot"].as_str().unwrap();
-    run(dir.path(), &["link", "remove", "one"], None)?;
-    let (code, replay) = run(dir.path(), &["--snapshot", snapshot, "links"], None)?;
-    assert_eq!(code, 0, "{replay}");
-    assert_eq!(before["data"], replay["data"]);
+    assert_eq!(before["data"]["links"].as_array().unwrap().len(), 1);
+    assert_eq!(run(dir.path(), &["link", "remove", "one"], None)?.0, 0);
+    assert_eq!(
+        run(dir.path(), &["links"], None)?.1["data"]["links"],
+        json!([])
+    );
     fs::write(dir.path().join("monika.links.json"), "corrupted")?;
     assert_eq!(run(dir.path(), &["links"], None)?.0, 2);
-    assert_eq!(
-        run(dir.path(), &["--snapshot", snapshot, "links"], None)?.0,
-        0
-    );
     Ok(())
 }
 
@@ -421,13 +536,10 @@ fn import_is_explicit_atomic_idempotent_and_retains_observation_provenance() -> 
     let observation =
         &before["observations"][before["origins"][0]["observation"].as_str().unwrap()];
     assert_eq!(
-        fs::read(
-            dir.path()
-                .join(".monika/blobs")
-                .join(observation["content_hash"].as_str().unwrap())
-        )?,
-        fs::read(dir.path().join("input.links"))?
+        observation["content_hash"],
+        monika::model::digest(&fs::read(dir.path().join("input.links"))?)
     );
+    assert!(!dir.path().join(".monika").exists());
     assert_eq!(
         run(
             dir.path(),
@@ -793,16 +905,8 @@ fn saved_generation_tracks_its_sidecar_basis_and_rejects_a_changed_authority() -
     );
     let (code, applied) = run(dir.path(), &["apply", "generate.json"], None)?;
     assert_eq!(code, 0, "{applied}");
-    let (code, replay) = run(
-        dir.path(),
-        &["--snapshot", applied["snapshot"].as_str().unwrap(), "links"],
-        None,
-    )?;
-    assert_eq!(code, 0, "{replay}");
-    assert_eq!(
-        replay["data"]["links"][0]["annotation"],
-        json!({"version":1})
-    );
+    let generated: Value = serde_json::from_slice(&fs::read(dir.path().join("out.links"))?)?;
+    assert_eq!(generated["links"][0]["annotation"], json!({"version":1}));
     assert_eq!(
         run(
             dir.path(),

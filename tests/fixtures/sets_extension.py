@@ -44,12 +44,18 @@ def read_resource(resource):
 
 
 def decode(content):
+    if NAME == "binary":
+        if not content.startswith(b"\xff\0"):
+            raise ValueError("invalid binary header")
+        return json.loads(content[2:])
     if NAME == "lines":
         return {"links": [json.loads(line) for line in content.splitlines() if line.strip()]}
     return json.loads(content)
 
 
 def encode(document):
+    if NAME == "binary":
+        return b"\xff\0" + json.dumps(document, ensure_ascii=False).encode()
     if NAME == "lines":
         return ("".join(json.dumps(link, ensure_ascii=False) + "\n" for link in document["links"])).encode()
     return (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode()

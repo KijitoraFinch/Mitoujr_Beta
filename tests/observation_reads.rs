@@ -83,7 +83,50 @@ fn deliveries(messages: &[Value]) -> usize {
 }
 
 #[tokio::test]
-async fn reads_follow_content_and_preserve_absence_and_dependencies_on_replay() -> Result<()> {
+async fn observation_files_survive_the_session_until_extension_cleanup_finishes() -> Result<()> {
+    for mode in ["chain", "fail_after_read", "hold_input"] {
+        let dir = tempfile::tempdir()?;
+        let workspace = workspace(dir.path(), false, 500).await?;
+        fs::write(dir.path().join("rows.json"), "[1,2,3]")?;
+        let target =
+            selector(json!({"mode":mode,"resource":workspace.resource("rows.json").await?}));
+        let mut host = Host::default();
+        let mut engine = Engine::new(Session::new(workspace), &mut host)?;
+        let result = engine.resolve(&target).await;
+        match mode {
+            "chain" => assert_eq!(result?.content["count"], 3),
+            "fail_after_read" => assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("interpretation failed")
+            ),
+            "hold_input" => assert!(result.unwrap_err().to_string().contains("timed out")),
+            _ => unreachable!(),
+        }
+        drop(engine);
+        let paths: Vec<String> = wire(dir.path())?
+            .iter()
+            .filter_map(|entry| entry["message"]["read_result"].as_array())
+            .flatten()
+            .map(|input| input["content_path"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(fs::read(&paths[0])?, b"[1,2,3]");
+        host.shutdown(false).await?;
+        if mode != "hold_input" {
+            let at_eof: Vec<String> =
+                serde_json::from_slice(&fs::read(dir.path().join("sets-eof-inputs.json"))?)?;
+            assert_eq!(at_eof, paths);
+        }
+        assert!(!Path::new(&paths[0]).exists());
+        assert!(!dir.path().join(".monika").exists());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn reads_follow_content_and_pin_absence_during_the_operation() -> Result<()> {
     for split in [false, true] {
         let dir = tempfile::tempdir()?;
         let workspace = workspace(dir.path(), split, 5_000).await?;
@@ -98,7 +141,7 @@ async fn reads_follow_content_and_preserve_absence_and_dependencies_on_replay() 
         fs::write(root.join("rows.json"), "[1,2,3]")?;
         let target = selector(json!({"mode":"chain", "resource":entry, "optional":optional}));
         let mut host = Host::default();
-        let mut engine = Engine::new(Session::new(workspace.clone())?, &mut host)?;
+        let mut engine = Engine::new(Session::new(workspace.clone()), &mut host)?;
         let region = engine.resolve(&target).await?;
         assert_eq!(region.content["count"], 3);
         assert_eq!(
@@ -106,12 +149,9 @@ async fn reads_follow_content_and_preserve_absence_and_dependencies_on_replay() 
             3,
             "includes entry and absent config, not just row content"
         );
-        assert!(!engine.session.snapshot.observations[&optional].state.exists);
-        assert_eq!(
-            engine.session.snapshot.resolution_reads[&serde_json::to_string(&target)?],
-            BTreeSet::from([entry, rows, optional])
-        );
-        let snapshot = engine.session.save().await?;
+        assert!(!engine.session.observations[&optional].state.exists);
+        let resources: BTreeSet<_> = engine.session.observations.keys().cloned().collect();
+        assert_eq!(resources, BTreeSet::from([entry, rows, optional]));
         let messages = wire(&root)?;
         assert_eq!(acquisitions(&messages), 3);
         assert_eq!(
@@ -122,12 +162,11 @@ async fn reads_follow_content_and_preserve_absence_and_dependencies_on_replay() 
         fs::write(root.join("optional.json"), "{\"minimum\":100}")?;
         fs::remove_file(root.join("entry.json"))?;
         fs::write(root.join("rows.json"), "[100]")?;
-        let mut replay = Engine::new(Session::replay(workspace, &snapshot).await?, &mut host)?;
-        assert_eq!(replay.resolve(&target).await?, region);
+        assert_eq!(engine.resolve(&target).await?, region);
         assert_eq!(
             acquisitions(&wire(&root)?),
             3,
-            "replay must not consult the live provider"
+            "repeated resolution uses the operation’s fixed Observations"
         );
         host.shutdown(false).await?;
     }
@@ -147,23 +186,16 @@ async fn unrelated_observations_do_not_enter_resolution_inputs_or_change_the_res
     let first = selector(json!({"resources":[a]}));
     let second = selector(json!({"resources":[b]}));
     let mut host = Host::default();
-    let mut engine = Engine::new(Session::new(workspace.clone())?, &mut host)?;
+    let mut engine = Engine::new(Session::new(workspace.clone()), &mut host)?;
     let before = engine.resolve(&first).await?;
     engine.observe("unrelated.json").await?;
-    engine.resolve(&second).await?;
-    let snapshot = engine.session.save().await?;
+    let other = engine.resolve(&second).await?;
     assert_eq!(deliveries(&wire(dir.path())?), 2);
-    assert!(
-        engine
-            .session
-            .snapshot
-            .resolution_reads
-            .values()
-            .all(|reads| reads.len() == 1)
-    );
-    let mut replay = Engine::new(Session::replay(workspace, &snapshot).await?, &mut host)?;
-    replay.resolve(&second).await?;
-    assert_eq!(replay.resolve(&first).await?, before);
+    assert_eq!(before.observations.len(), 1);
+    assert_eq!(other.observations.len(), 1);
+    assert_ne!(before.observations, other.observations);
+    engine.resolve(&second).await?;
+    assert_eq!(engine.resolve(&first).await?, before);
     assert_eq!(deliveries(&wire(dir.path())?), 4);
     assert_eq!(acquisitions(&wire(dir.path())?), 3);
     host.shutdown(false).await?;
@@ -171,24 +203,19 @@ async fn unrelated_observations_do_not_enter_resolution_inputs_or_change_the_res
 }
 
 #[tokio::test]
-async fn failed_reads_cannot_be_hidden_and_replay_does_not_retry_them() -> Result<()> {
+async fn failed_reads_cannot_be_hidden_or_retried_within_a_session() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let workspace = workspace(dir.path(), true, 5_000).await?;
     let resource = workspace.resource("unavailable.json").await?;
     let target = selector(json!({"mode":"ignore_failure","resource":resource}));
     let mut host = Host::default();
-    let mut engine = Engine::new(Session::new(workspace.clone())?, &mut host)?;
+    let mut engine = Engine::new(Session::new(workspace.clone()), &mut host)?;
     let error = engine.resolve(&target).await.unwrap_err();
     assert!(
         error.to_string().contains("provider unavailable"),
         "{error:#}"
     );
-    assert!(engine.session.snapshot.failures.contains_key(&resource));
-    assert_eq!(
-        engine.session.snapshot.resolution_reads[&serde_json::to_string(&target)?],
-        BTreeSet::from([resource])
-    );
-    let snapshot = engine.session.save().await?;
+    assert!(engine.session.failures.contains_key(&resource));
     fs::write(dir.path().join("good.json"), "[7]")?;
     assert_eq!(
         engine
@@ -198,9 +225,8 @@ async fn failed_reads_cannot_be_hidden_and_replay_does_not_retry_them() -> Resul
         1
     );
     let count = acquisitions(&wire(dir.path())?);
-    let mut replay = Engine::new(Session::replay(workspace, &snapshot).await?, &mut host)?;
     assert!(
-        replay
+        engine
             .resolve(&target)
             .await
             .unwrap_err()
@@ -213,7 +239,7 @@ async fn failed_reads_cannot_be_hidden_and_replay_does_not_retry_them() -> Resul
 }
 
 #[tokio::test]
-async fn replay_rejects_new_dependencies_even_when_another_selector_observed_them() -> Result<()> {
+async fn repeated_resolution_can_change_reads_without_changing_the_region() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let workspace = workspace(dir.path(), false, 5_000).await?;
     fs::write(dir.path().join("a.json"), "[1]")?;
@@ -221,25 +247,111 @@ async fn replay_rejects_new_dependencies_even_when_another_selector_observed_the
     let target = selector(json!({"mode":"changing_reads",
         "resource":workspace.resource("a.json").await?, "extra":workspace.resource("b.json").await?}));
     let mut host = Host::default();
-    let mut engine = Engine::new(Session::new(workspace.clone())?, &mut host)?;
-    engine.resolve(&target).await?;
-    engine.observe("b.json").await?;
-    let snapshot = engine.session.save().await?;
-    let mut replay = Engine::new(Session::replay(workspace, &snapshot).await?, &mut host)?;
-    let error = replay.resolve(&target).await.unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("outside the recorded resolution reads"),
-        "{error:#}"
+    let mut engine = Engine::new(Session::new(workspace), &mut host)?;
+    let report = monika::extension_test::test_regions(&mut engine, &[target]).await?;
+    assert!(report.passed, "{:?}", report.failures);
+    let messages = wire(dir.path())?;
+    assert_eq!(
+        messages
+            .iter()
+            .filter(|m| m["message"]["operation"] == "resolve")
+            .count(),
+        2
     );
-    assert_eq!(acquisitions(&wire(dir.path())?), 2);
+    assert_eq!(acquisitions(&messages), 2);
+    assert_eq!(deliveries(&messages), 3);
     host.shutdown(false).await?;
     Ok(())
 }
 
 #[tokio::test]
-async fn core_owns_dependency_metadata_and_batch_reads_are_scoped() -> Result<()> {
+async fn extension_cache_tracks_backend_settings_and_current_observations() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let workspace = workspace(dir.path(), false, 5_000).await?;
+    let resource = workspace.resource("rows.json").await?;
+    let target = selector(json!({"mode":"cached_project", "resource":resource}));
+    let mut host = Host::default();
+    let mut previous_id = None;
+    // Only change inputs between operations. Keep the same extension process
+    // to exercise its cache across fresh Observation sessions as well.
+    for (minimum, rows, count) in [
+        (0, "[1,2,3]", 3),
+        (0, "[1,2,3]", 3),
+        (3, "[1,2,3]", 1),
+        (3, "[1,2,3,4]", 2),
+    ] {
+        fs::write(
+            dir.path().join("project.json"),
+            serde_json::to_vec(&json!({"minimum":minimum}))?,
+        )?;
+        fs::write(dir.path().join("rows.json"), rows)?;
+        let mut engine = Engine::new(Session::new(workspace.clone()), &mut host)?;
+        let region = engine.resolve(&target).await?;
+        assert_eq!(region.content["count"], count);
+        assert_eq!(engine.resolve(&target).await?, region);
+        assert_eq!(engine.session.observations.len(), 1);
+        let observed = &engine.session.observations[&resource];
+        assert_eq!(region.observations, vec![observed.id.clone()]);
+        assert_ne!(previous_id.as_ref(), Some(&observed.id));
+        for member in region.identity.as_array().unwrap() {
+            assert_eq!(member[0], observed.id);
+        }
+        previous_id = Some(observed.id.clone());
+    }
+    let hits: Vec<bool> = fs::read_to_string(dir.path().join("cache-events.jsonl"))?
+        .lines()
+        .map(|line| {
+            Ok(serde_json::from_str::<Value>(line)?["hit"]
+                .as_bool()
+                .unwrap())
+        })
+        .collect::<Result<_>>()?;
+    assert_eq!(hits, [false, true, true, true, false, true, false, true]);
+    let messages = wire(dir.path())?;
+    assert_eq!(acquisitions(&messages), 4);
+    assert_eq!(deliveries(&messages), 8);
+    host.shutdown(false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_later_resolution_calls_the_extension_after_an_operation_error() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let workspace = workspace(dir.path(), false, 5_000).await?;
+    fs::write(dir.path().join("rows.json"), "[1]")?;
+    let target = selector(json!({"mode":"transient_failure",
+        "resource":workspace.resource("rows.json").await?}));
+    let mut host = Host::default();
+    let mut engine = Engine::new(Session::new(workspace), &mut host)?;
+    assert!(
+        engine
+            .resolve(&target)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("backend not ready")
+    );
+    assert_eq!(
+        wire(dir.path())?
+            .iter()
+            .filter(|m| m["message"]["operation"] == "resolve")
+            .count(),
+        1
+    );
+    assert_eq!(engine.resolve(&target).await?.content["count"], 1);
+    assert_eq!(
+        wire(dir.path())?
+            .iter()
+            .filter(|m| m["message"]["operation"] == "resolve")
+            .count(),
+        2
+    );
+    host.shutdown(false).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn core_records_observation_reads_and_batch_reads_are_scoped() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let workspace = workspace(dir.path(), false, 5_000).await?;
     fs::write(dir.path().join("a.json"), "[1]")?;
@@ -247,7 +359,7 @@ async fn core_owns_dependency_metadata_and_batch_reads_are_scoped() -> Result<()
     let a = workspace.resource("a.json").await?;
     let b = workspace.resource("b.json").await?;
     let mut host = Host::default();
-    let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
+    let mut engine = Engine::new(Session::new(workspace), &mut host)?;
     let region = engine
         .resolve(&selector(json!({"resources":[a,b]})))
         .await?;
@@ -274,7 +386,7 @@ async fn resolution_deadline_includes_other_providers_and_repeated_read_requests
         let mut query = query;
         query["resource"] = workspace.resource("waiting.json").await?.into();
         let mut host = Host::default();
-        let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
+        let mut engine = Engine::new(Session::new(workspace), &mut host)?;
         let start = Instant::now();
         let error = timeout(Duration::from_secs(3), engine.resolve(&selector(query)))
             .await?
@@ -294,7 +406,7 @@ async fn cancellation_while_a_provider_is_pending_closes_both_processes() -> Res
     let target =
         selector(json!({"mode":"chain", "resource":workspace.resource("waiting.json").await?}));
     let mut host = Host::default();
-    let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
+    let mut engine = Engine::new(Session::new(workspace), &mut host)?;
     let mut resolving = Box::pin(engine.resolve(&target));
     let waiting = async {
         while !tokio::fs::try_exists(dir.path().join("provider-waiting")).await? {
@@ -330,7 +442,6 @@ async fn cancellation_while_a_provider_is_pending_closes_both_processes() -> Res
 
 #[tokio::test]
 async fn narrow_query_does_not_acquire_resources_or_start_extensions() -> Result<()> {
-    let mut sizes = Vec::new();
     for count in [100, 600] {
         let dir = tempfile::tempdir()?;
         let workspace = workspace(dir.path(), false, 10_000).await?;
@@ -346,31 +457,19 @@ async fn narrow_query_does_not_acquire_resources_or_start_extensions() -> Result
             serde_json::to_vec(&json!({"version":1,"revision":1,"links":links,"origins":[]}))?,
         )?;
         let mut host = Host::default();
-        let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
-        let start = Instant::now();
+        let mut engine = Engine::new(Session::new(workspace), &mut host)?;
         let result =
             operations::select(&mut engine, Some(&Expression::parse("id == \"0\"")?)).await?;
         assert!(result.complete);
         assert_eq!(result.links.len(), 1);
         assert_eq!(result.links[0].id, "0");
-        assert!(engine.session.snapshot.observations.is_empty());
-        assert!(engine.session.snapshot.resolution_reads.is_empty());
-        let snapshot = engine.session.save().await?;
+        assert!(engine.session.observations.is_empty());
         host.shutdown(false).await?;
         assert!(
             !dir.path().join("wire.jsonl").exists(),
             "query started an extension"
         );
-        let size = fs::metadata(dir.path().join(".monika/snapshots").join(snapshot))?.len();
-        sizes.push(size);
-        eprintln!(
-            "links={count}, observed=0, metadata_sent=0, snapshot_bytes={size}, elapsed={:?}",
-            start.elapsed()
-        );
+        assert!(!dir.path().join(".monika").exists());
     }
-    assert!(
-        sizes[1] < sizes[0] * 7,
-        "Sidecar snapshot grew superlinearly: {sizes:?}"
-    );
     Ok(())
 }

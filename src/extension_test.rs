@@ -19,8 +19,9 @@ pub struct TestFailure {
     pub message: String,
 }
 
-/// Test the extension's real operations, bypassing resolution caches. Input
-/// indices identify the supplied selectors, so failed laws can be reproduced.
+/// Test observable consistency and comparison laws under stable external state.
+/// Extension-owned caches remain active. These samples do not prove that an
+/// extension's dependency tracking or cache invalidation is complete.
 pub async fn test_regions(
     engine: &mut Engine<'_>,
     selectors: &[RegionSelector],
@@ -38,15 +39,28 @@ pub async fn test_regions(
     };
     let mut regions = Vec::new();
     for (index, selector) in selectors.iter().enumerate() {
-        match engine.resolve_uncached(selector).await {
+        match engine.resolve(selector).await {
             Ok(region) => {
-                match engine.resolve_uncached(selector).await {
-                    Ok(repeated) if repeated == region => {}
-                    Ok(_) => report.fail(
-                        "resolution_determinism",
-                        vec![index],
-                        "repeated resolution returned a different region",
-                    ),
+                match engine.resolve(selector).await {
+                    Ok(repeated) => {
+                        report.comparison_calls += 1;
+                        match engine.compare(&region, &repeated).await {
+                            Ok(Relation::Equal) => {}
+                            Ok(_) => report.fail(
+                                "resolution_determinism",
+                                vec![index],
+                                "repeated resolution returned a different region",
+                            ),
+                            Err(error) => {
+                                report.complete = false;
+                                report.fail(
+                                    "resolution_determinism",
+                                    vec![index],
+                                    format!("{error:#}"),
+                                );
+                            }
+                        }
+                    }
                     Err(error) => {
                         report.complete = false;
                         report.fail("resolution_determinism", vec![index], format!("{error:#}"))

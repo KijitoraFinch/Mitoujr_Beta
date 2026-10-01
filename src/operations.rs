@@ -62,8 +62,8 @@ pub struct Response {
     pub schema: u32,
     pub ok: bool,
     pub complete: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub snapshot: Option<String>,
+    pub observations: BTreeMap<String, Observation>,
+    pub diagnostics: Vec<Diagnostic>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -78,7 +78,8 @@ impl Response {
             schema: 1,
             ok: false,
             complete: false,
-            snapshot: None,
+            observations: BTreeMap::new(),
+            diagnostics: Vec::new(),
             data: None,
             error: Some(error.to_string()),
             exit_code: 2,
@@ -186,8 +187,6 @@ pub struct CheckResult {
 struct CheckRegionInput {
     name: String,
     target: Target,
-    #[serde(default)]
-    snapshot: Option<String>,
 }
 
 pub async fn check(
@@ -251,21 +250,8 @@ pub async fn check(
                         "duplicate check input name: {}",
                         input.name
                     );
-                    let region = if let Some(snapshot) = input.snapshot {
-                        let mut historical = Engine::new(Session::replay(
-                            engine.session.workspace.clone(),
-                            &snapshot,
-                        ).await?, engine.host)?;
-                        let selector = input
-                            .target
-                            .expand(&historical.session.workspace.config.names)?;
-                        historical.resolve(&selector).await?
-                    } else {
-                        let selector = input
-                            .target
-                            .expand(&engine.session.workspace.config.names)?;
-                        engine.resolve(&selector).await?
-                    };
+                    let selector = input.target.expand(&engine.session.workspace.config.names)?;
+                    let region = engine.resolve(&selector).await?;
                     regions.insert(input.name, region);
                 }
                 serde_json::from_value(engine.call(
@@ -345,13 +331,11 @@ pub async fn check(
 
 pub async fn execute(
     workspace: Workspace,
-    snapshot: Option<&str>,
     operation: Operation,
     host: &mut crate::extensions::process::Host,
 ) -> Response {
     if let Operation::Init = operation {
         return match (async {
-            ensure!(snapshot.is_none(), "init does not accept --snapshot");
             Ok::<_, anyhow::Error>(json!({"config": workspace.initialize().await?}))
         })
         .await
@@ -360,7 +344,8 @@ pub async fn execute(
                 schema: 1,
                 ok: true,
                 complete: true,
-                snapshot: None,
+                observations: BTreeMap::new(),
+                diagnostics: Vec::new(),
                 data: Some(data),
                 error: None,
                 exit_code: 0,
@@ -368,17 +353,7 @@ pub async fn execute(
             Err(error) => Response::error(format!("{error:#}")),
         };
     }
-    let prepared = (async {
-        Engine::new(
-            match snapshot {
-                Some(id) => Session::replay(workspace, id).await?,
-                None => Session::new(workspace)?,
-            },
-            host,
-        )
-    })
-    .await;
-    let mut engine = match prepared {
+    let mut engine = match Engine::new(Session::new(workspace), host) {
         Ok(engine) => engine,
         Err(error) => return Response::error(format!("{error:#}")),
     };
@@ -448,36 +423,27 @@ pub async fn execute(
             ),
         })
     }).await;
-    let snapshot = match engine.session.save().await {
-        Ok(snapshot) => snapshot,
-        Err(error) => return Response::error(format!("save observations: {error:#}")),
+    let mut response = match result {
+        Ok((data, complete, exit_code)) => Response {
+            schema: 1,
+            ok: true,
+            complete,
+            observations: BTreeMap::new(),
+            diagnostics: Vec::new(),
+            data: Some(data),
+            error: None,
+            exit_code,
+        },
+        Err(error) => Response::error(format!("{error:#}")),
     };
-    match result {
-        Ok((mut data, complete, exit_code)) => {
-            let result_snapshot =
-                if let Some(committed) = data.pointer("/commit/snapshot").and_then(Value::as_str) {
-                    let committed = committed.to_owned();
-                    data["base_snapshot"] = json!(snapshot);
-                    committed
-                } else {
-                    snapshot
-                };
-            Response {
-                schema: 1,
-                ok: true,
-                complete,
-                snapshot: Some(result_snapshot),
-                data: Some(data),
-                error: None,
-                exit_code,
-            }
-        }
-        Err(error) => {
-            let mut response = Response::error(format!("{error:#}"));
-            response.snapshot = Some(snapshot);
-            response
-        }
-    }
+    response.observations = engine
+        .session
+        .observations
+        .into_values()
+        .map(|observation| (observation.id.clone(), observation))
+        .collect();
+    response.diagnostics = engine.session.failures.into_values().collect();
+    response
 }
 
 async fn finish_edit(
@@ -492,7 +458,7 @@ async fn finish_edit(
         engine
             .session
             .workspace
-            .publish_new(&path, &bytes, false)
+            .publish_new(&path, &bytes)
             .await
             .context("save patch (destination must not exist)")?;
         Ok(json!({"patch": patch, "path": path, "applied": false}))

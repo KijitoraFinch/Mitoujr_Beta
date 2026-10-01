@@ -349,6 +349,50 @@ async fn cancelling_a_request_invalidates_the_worker_without_restarting_it() -> 
 
 #[cfg(unix)]
 #[tokio::test]
+async fn interruption_removes_observation_inputs_after_stopping_the_extension() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let config = json!({"version":1,"extensions":{"sets":{
+        "command":["python3",format!("{}/tests/fixtures/reading_extension.py",env!("CARGO_MANIFEST_DIR"))],
+        "revision":"test-v1","schemes":["file"]
+    }}});
+    tokio::fs::write(dir.path().join("monika.json"), serde_json::to_vec(&config)?).await?;
+    tokio::fs::write(dir.path().join("rows.json"), b"[1,2,3]").await?;
+    let workspace = monika::workspace::Workspace::open(dir.path()).await?;
+    let request = json!({"op":"show","target":{"extension":"sets","query":{
+        "mode":"hold_input","resource":workspace.resource("rows.json").await?
+    }}});
+    let mut child = cli(dir.path()).arg("request").spawn()?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_json::to_vec(&request)?)
+        .await?;
+    let ready = dir.path().join("input-ready.json");
+    timeout(Duration::from_secs(3), async {
+        while !tokio::fs::try_exists(&ready).await? {
+            sleep(Duration::from_millis(10)).await;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    let input: Value = serde_json::from_slice(&tokio::fs::read(&ready).await?)?;
+    let path = Path::new(input["path"].as_str().unwrap());
+    assert_eq!(tokio::fs::read(path).await?, b"[1,2,3]");
+    // SAFETY: this PID belongs to the live CLI spawned above.
+    assert_eq!(
+        unsafe { libc::kill(child.id().unwrap() as libc::pid_t, libc::SIGINT) },
+        0
+    );
+    let output = timeout(Duration::from_secs(3), child.wait_with_output()).await??;
+    assert_eq!(output.status.code(), Some(130));
+    wait_until_gone(input["pid"].as_i64().unwrap() as libc::pid_t).await?;
+    assert!(!tokio::fs::try_exists(path).await?);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn interruption_after_commit_reports_uncertainty_and_does_not_repeat_the_write() -> Result<()>
 {
     let dir = tempfile::tempdir()?;

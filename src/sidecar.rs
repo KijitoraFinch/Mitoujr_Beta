@@ -145,7 +145,7 @@ pub async fn normalize(workspace: &Workspace, mut link: Link) -> Result<Link> {
     Ok(link)
 }
 
-/// The dedicated Sidecar state is saved independently of Resource Observations.
+/// Sidecar contents and the hash used to check a proposed update.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SidecarState {
@@ -178,11 +178,10 @@ pub async fn read(workspace: &Workspace) -> Result<SidecarState> {
 
 impl Session {
     pub async fn sidecar(&mut self) -> Result<&SidecarState> {
-        if self.snapshot.sidecar.is_none() {
-            ensure!(!self.frozen, "Sidecar was not read in this snapshot");
-            self.snapshot.sidecar = Some(read(&self.workspace).await?);
+        if self.sidecar.is_none() {
+            self.sidecar = Some(read(&self.workspace).await?);
         }
-        Ok(self.snapshot.sidecar.as_ref().expect("Sidecar loaded"))
+        Ok(self.sidecar.as_ref().expect("Sidecar loaded"))
     }
 }
 

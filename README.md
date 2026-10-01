@@ -21,7 +21,7 @@ python3 examples/demo.py
 
 デモは一時ディレクトリを作り、[試験用の外部拡張](tests/fixtures/sets_extension.py)を登録する。
 JSON のデータ行を Region として扱い、Sidecar の編集、問い合わせ、検査、変更案の保存と適用、
-外部への生成、Observation からの取り込み、保存した Observation を使った解決を検証する。
+外部への生成、Observation からの取り込み、Resource 更新後の解決を検証する。
 `--directory /tmp/monika-demo` を渡すと、新規作成した作業ディレクトリを残せる。
 試験用拡張は Core に同梱される形式対応ではなく、テストとデモの設定から起動する。
 
@@ -58,7 +58,7 @@ Region として同じかどうかの検査には、`check --duplicates` を使�
 `--root DIR` はプロジェクトのルート。省略時は現在地から上に `monika.json` または `.git` を探す。
 Core が受け取る相対 Resource パスと `--patch-out` の相対パスは、このルートを基準にする。
 パスの親ディレクトリは OS に解決させ、URI には `url` クレートを使う。
-保存済み URI は、過去の状態での再実行でも同じアドレスとして扱う。
+保存済み URI は同じアドレスとして扱う。
 
 | コマンド | 操作 |
 | --- | --- |
@@ -83,6 +83,7 @@ Core が受け取る相対 Resource パスと `--patch-out` の相対パスは�
 適用時には元の内容を照合する。Sidecar の書き込みは OS のロックと一時ファイルからの置換を使い、
 別の Monika 操作が行った変更を上書きしない。直接編集する場合は Monika の書き込みと同時に行わない。
 `.monika-sidecar.lock` は Git の対象から外し、実行中に削除しない。
+変更案は、適用する内容と照合に必要な情報を自身に持つ。保存した変更案は、次の CLI 操作で適用できる。
 
 取り込みは指定した Resource の Observation を入力にする。Link の内容が既存の同じ ID と一致すれば
 取り込み元を記録し、食い違う場合や一部の解釈に失敗した場合は全体を適用しない。
@@ -128,26 +129,20 @@ ID・注釈だけの問い合わせでは Resource を取得しない。Region �
 拡張は Observation に加えて LS やプロジェクト設定なども参照できる。
 解決・比較のキャッシュと更新は拡張が管理する。
 
-現行実装では、各操作は使用した Observation と設定を `.monika/` に保存し、`snapshot` ID を返す。
-Sidecar を読んだ操作では、その状態も保存する。
-`--snapshot ID` は Core が渡す Observation・Sidecar・設定を保存済みのものにする。
-Core は未取得の Resource を観測し直さず、現在の Sidecar も読み直さない。
-拡張が使う外部状態は拡張自身が扱う。
-
-`.monika/` の削除は Sidecar の Link を変更しない。ただし削除した過去の Observation の内容と snapshot は復元できない。
-Sidecar に保持する取り込み元のメタデータは、Observation の内容そのものを複製するものではない。
-編集の結果には適用後の `snapshot` と、適用前の `data.base_snapshot` がある。
-Resource への生成後の snapshot は生成先の Observation と Sidecar の状態を含む。
-保存した変更案の適用には、そこで参照した入力の保存済み内容も必要になる。
-履歴を VCS に委ねる設計への変更点は [実装との差分](IMPLEMENTATION.md#設計との差分) に記載する。
+Observation の内容は操作中に保持する。拡張に渡す一時ファイルは、拡張プロセスの終了後に削除する。
+履歴は VCS や Resource の提供元に任せ、Monika は履歴用に Observation を保存しない。
+過去の状態を調べるときは、そこで用意した状態に対して操作する。
+Sidecar には取り込み元の Observation メタデータを保持する。
 
 `--json` と `request` の応答:
 
 ```json
-{"schema":1,"ok":true,"complete":true,"snapshot":"...","data":{}}
+{"schema":1,"ok":true,"complete":true,"observations":{},"diagnostics":[],"data":{}}
 ```
 
 `ok` は操作を結果として返せたか、`complete` は必要な評価・検査を完了できたかを示す。
+応答直下の `observations` は操作中に取得した Observation のメタデータを ID ごとに持ち、
+`diagnostics` は観測失敗を記録する。生成の適用後の Observation は `data.commit.observation` に返す。
 `links` は `links`・`origins`・取り込み元の `observations`・`undetermined`・`diagnostics` を返す。
 `check` はその選択に加えて `findings`・`duplicates`・`valid` を返す。
 取得・解釈・比較の失敗は `diagnostics` に残り、検査で確認した不整合と区別する。

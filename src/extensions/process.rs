@@ -1,4 +1,4 @@
-use crate::model::require_version;
+use crate::model::{Observation, require_version};
 use crate::workspace::ProcessExtension;
 use anyhow::{Context, Result, bail, ensure};
 use futures_util::{StreamExt, future::join_all};
@@ -117,14 +117,33 @@ enum State {
     Unavailable(String),
 }
 
-/// Owns every extension started by one CLI operation, including historical and
-/// post-commit observation sessions. The caller always awaits shutdown.
+/// Owns the extension processes and their input files for one CLI operation.
+/// The caller always awaits shutdown before the input files are removed.
 #[derive(Default)]
 pub struct Host {
     workers: BTreeMap<(PathBuf, String, String), Worker>,
+    inputs: BTreeMap<String, tempfile::NamedTempFile>,
 }
 
 impl Host {
+    pub(crate) async fn observation_input(
+        &mut self,
+        observation: &Observation,
+        bytes: &[u8],
+    ) -> Result<Value> {
+        if !self.inputs.contains_key(&observation.id) {
+            observation.verify(bytes)?;
+            let file = tempfile::Builder::new()
+                .prefix("monika-observation-")
+                .tempfile()?;
+            let mut output = tokio::fs::File::from_std(file.reopen()?);
+            output.write_all(bytes).await?;
+            output.flush().await?;
+            self.inputs.insert(observation.id.clone(), file);
+        }
+        Ok(json!({"observation": observation, "content_path": self.inputs[&observation.id].path()}))
+    }
+
     pub fn worker(
         &mut self,
         root: &Path,
@@ -155,11 +174,16 @@ impl Host {
                 }),
         )
         .await;
-        let errors: Vec<_> = results
+        let mut errors: Vec<_> = results
             .into_iter()
             .filter_map(Result::err)
             .map(|error| format!("{error:#}"))
             .collect();
+        for file in std::mem::take(&mut self.inputs).into_values() {
+            if let Err(error) = file.close() {
+                errors.push(format!("remove Observation input: {error}"));
+            }
+        }
         ensure!(
             errors.is_empty(),
             "extension shutdown failed: {}",

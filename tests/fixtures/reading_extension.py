@@ -11,6 +11,7 @@ from extension_api import Extension
 
 
 calls = {}
+project_cache = {}
 
 
 def execute(operation, data, context):
@@ -28,6 +29,31 @@ def execute(operation, data, context):
 
     query = data["selector"]["query"]
     mode = query["mode"]
+    if mode == "cached_project":
+        # The project settings are a backend input, not an Observation. Cache
+        # row selection independently of Observation IDs, then attach the ID
+        # obtained for this call even on a hit.
+        project = (context.workspace / "project.json").read_bytes()
+        item = context.read(query["resource"])
+        observation = item["observation"]
+        key = (str(context.workspace), observation["resource"],
+               observation["content_hash"], observation["state"]["exists"], project)
+        hit = key in project_cache
+        if not hit:
+            minimum = json.loads(project)["minimum"]
+            rows = json.loads(pathlib.Path(item["content_path"]).read_bytes())
+            project_cache[key] = [i for i, row in enumerate(rows) if row >= minimum]
+        with (context.workspace / "cache-events.jsonl").open("a") as log:
+            log.write(json.dumps({"hit": hit}) + "\n")
+        selected = project_cache[key]
+        return {"domain": "test.sets.v1",
+                "identity": [[observation["id"], i] for i in selected],
+                "content": {"count": len(selected)}}
+    if mode == "transient_failure":
+        key = json.dumps(query, sort_keys=True)
+        calls[key] = calls.get(key, 0) + 1
+        if calls[key] == 1:
+            raise RuntimeError("backend not ready")
     if mode == "ignore_failure":
         try:
             context.read(query["resource"])
@@ -52,6 +78,13 @@ def execute(operation, data, context):
         if config["observation"]["state"]["exists"]:
             minimum = json.loads(pathlib.Path(config["content_path"]).read_bytes())["minimum"]
     item = context.read(query["resource"])
+    if mode == "fail_after_read":
+        raise RuntimeError("interpretation failed after reading")
+    if mode == "hold_input":
+        marker = context.workspace / "input-ready.tmp"
+        marker.write_text(json.dumps({"pid": os.getpid(), "path": item["content_path"]}))
+        marker.replace(context.workspace / "input-ready.json")
+        time.sleep(60)
     while True:
         document = json.loads(pathlib.Path(item["content_path"]).read_bytes())
         if isinstance(document, dict) and "next" in document:
@@ -69,6 +102,16 @@ def execute(operation, data, context):
 
 
 class TracedExtension(Extension):
+    def run(self):
+        self.input_paths = set()
+        super().run()
+        # Cleanup may still use the input after the last result was returned.
+        for path in self.input_paths:
+            pathlib.Path(path).read_bytes()
+        if self.input_paths:
+            (self.workspace / f"{sets.NAME}-eof-inputs.json").write_text(
+                json.dumps(sorted(self.input_paths)))
+
     def dispatch(self, request):
         self.workspace = pathlib.Path(request["workspace"])
         self.record("input", request)
@@ -81,6 +124,8 @@ class TracedExtension(Extension):
 
     def receive(self):
         message = super().receive()
+        for item in message.get("read_result", []):
+            self.input_paths.add(item["content_path"])
         if "operation" not in message:
             self.record("input", message)
         return message

@@ -30,7 +30,8 @@ async fn configure(path: &Path) -> Result<Workspace> {
 }
 
 #[tokio::test]
-async fn real_process_resolves_multiple_observations_and_replays_saved_content() -> Result<()> {
+async fn real_process_resolves_multiple_observations_and_fresh_sessions_observe_changes()
+-> Result<()> {
     let mut host = process::Host::default();
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("a.json"), "[1,2,3]")?;
@@ -43,7 +44,7 @@ async fn real_process_resolves_multiple_observations_and_replays_saved_content()
         resource: None,
         query: json!({"resources": [a, b], "minimum": minimum}),
     };
-    let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
+    let mut engine = Engine::new(Session::new(workspace), &mut host)?;
     let all = engine.resolve(&selector(0)).await?;
     let part = engine.resolve(&selector(3)).await?;
     assert_eq!(all.content["count"], 5);
@@ -51,16 +52,14 @@ async fn real_process_resolves_multiple_observations_and_replays_saved_content()
     assert_eq!(all.observations.len(), 2);
     assert_eq!(engine.compare(&all, &part).await?, Relation::Contains);
     assert_eq!(engine.compare(&part, &all).await?, Relation::Within);
-    let snapshot = engine.session.save().await?;
     fs::write(dir.path().join("a.json"), "[100]")?;
-    fs::remove_file(dir.path().join("b.json"))?;
-    let mut replay = Engine::new(
-        Session::replay(Workspace::open(dir.path()).await?, &snapshot).await?,
-        &mut host,
-    )?;
-    assert_eq!(replay.resolve(&selector(0)).await?, all);
-    assert_eq!(replay.resolve(&selector(3)).await?, part);
-    assert_eq!(replay.compare(&all, &part).await?, Relation::Contains);
+    fs::write(dir.path().join("b.json"), "[200]")?;
+    assert_eq!(engine.resolve(&selector(0)).await?, all);
+    let mut current = Engine::new(Session::new(Workspace::open(dir.path()).await?), &mut host)?;
+    let changed = current.resolve(&selector(0)).await?;
+    assert_eq!(changed.content["count"], 2);
+    assert_ne!(changed.observations, all.observations);
+    assert!(!dir.path().join(".monika").exists());
     host.shutdown(false).await?;
     Ok(())
 }
@@ -75,10 +74,10 @@ async fn process_observation_freezes_external_resource_and_reports_failure() -> 
         .resource("external.json")
         .await?
         .replacen("file:", "fixture:", 1);
-    let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
+    let mut engine = Engine::new(Session::new(workspace), &mut host)?;
     let observed = engine.observe(&resource).await?;
     fs::write(dir.path().join("external.json"), "[24]")?;
-    assert_eq!(engine.session.bytes(&observed).await?, b"[42]");
+    assert_eq!(engine.session.bytes(&observed)?, b"[42]");
     assert_eq!(engine.observe(&resource).await?, observed);
     let missing = engine
         .session
@@ -98,13 +97,7 @@ async fn process_observation_freezes_external_resource_and_reports_failure() -> 
             .is_err()
     );
     assert!(engine.observe("unsupported:resource").await.is_err());
-    assert!(
-        engine
-            .session
-            .snapshot
-            .failures
-            .contains_key("unsupported:resource")
-    );
+    assert!(engine.session.failures.contains_key("unsupported:resource"));
     host.shutdown(false).await?;
     Ok(())
 }
@@ -159,7 +152,7 @@ async fn empty_configuration_has_no_builtin_extensions_or_observation_provider()
     let mut host = process::Host::default();
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("sample.md"), "[link](somewhere)\n")?;
-    let mut engine = Engine::new(Session::new(Workspace::open(dir.path()).await?)?, &mut host)?;
+    let mut engine = Engine::new(Session::new(Workspace::open(dir.path()).await?), &mut host)?;
     assert!(engine.manifests().await?.is_empty());
     assert!(engine.session.sidecar().await.is_err());
     for name in ["file", "text", "md", "sidecar", "rust", "ts", "python"] {
@@ -215,10 +208,10 @@ async fn external_regions_obey_comparison_laws_including_empty_and_multi_resourc
         resource: None,
         query: json!({"resources":[resource],"minimum":6}),
     });
-    let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
+    let mut engine = Engine::new(Session::new(workspace), &mut host)?;
     let report = monika::extension_test::test_regions(&mut engine, &selectors).await?;
     assert!(report.passed, "{:?}", report.failures);
-    assert_eq!(report.comparison_calls, 98);
+    assert_eq!(report.comparison_calls, 105);
     host.shutdown(false).await?;
     Ok(())
 }
@@ -238,7 +231,7 @@ async fn separate_extensions_share_a_comparison_domain_via_explicit_provider() -
         .config
         .comparators
         .insert("test.sets.v1".into(), "sets".into());
-    let mut engine = Engine::new(Session::new(workspace)?, &mut host)?;
+    let mut engine = Engine::new(Session::new(workspace), &mut host)?;
     let make_selector = |extension: &str, minimum| RegionSelector {
         extension: extension.into(),
         resource: None,
@@ -340,7 +333,7 @@ async fn import_interprets_the_observation_even_after_the_resource_changes() -> 
         serde_json::to_vec(&json!({"links":[link]}))?,
     )?;
     let mut host = process::Host::default();
-    let mut engine = Engine::new(Session::new(workspace.clone())?, &mut host)?;
+    let mut engine = Engine::new(Session::new(workspace.clone()), &mut host)?;
     let observed = engine.observe("input.json").await?;
     fs::write(
         dir.path().join("input.json"),
@@ -359,9 +352,10 @@ async fn import_interprets_the_observation_even_after_the_resource_changes() -> 
     assert_eq!(state.data.links[0].annotation, link["annotation"]);
     assert_eq!(state.data.observations.len(), 1);
     assert_eq!(state.data.origins[0].observation, observed.id);
-    let mut replay = Session::replay(workspace, result["snapshot"].as_str().unwrap()).await?;
-    assert_eq!(replay.sidecar().await?.data.links, state.data.links);
-    assert_eq!(replay.snapshot.observations[&observed.resource], observed);
+    assert_eq!(result["sidecar"], state.content_hash.unwrap());
+    assert_eq!(engine.session.sidecar().await?.data.links, state.data.links);
+    assert_eq!(engine.session.observations[&observed.resource], observed);
+    assert!(!dir.path().join(".monika").exists());
     host.shutdown(false).await?;
     Ok(())
 }

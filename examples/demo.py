@@ -79,8 +79,8 @@ def demonstrate(binary, directory):
     assert tested["data"]["passed"]
     (directory / "rows.json").write_text("[1, 2, 3, 4]\n")
     run("check", expected=1)
-    replay = run("--snapshot", shown["snapshot"], "show", "@subset")
-    assert replay["data"] == shown["data"]
+    latest = run("show", "@subset")
+    assert latest["data"]["region"]["content"]["count"] == 3
     print(f"Verified workspace: {directory}")
 
 

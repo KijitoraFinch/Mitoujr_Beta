@@ -25,8 +25,6 @@ struct Cli {
         help = "Project root (otherwise discover monika.json or .git)"
     )]
     root: Option<PathBuf>,
-    #[arg(long, global = true, help = "Reuse a saved observation snapshot")]
-    snapshot: Option<String>,
     #[arg(
         long,
         global = true,
@@ -376,9 +374,6 @@ fn render_human(response: &Response) -> Result<(Vec<u8>, Vec<u8>)> {
             writeln!(stdout, "{}", serde_json::to_string_pretty(data)?)?;
         }
     }
-    if let Some(snapshot) = &response.snapshot {
-        writeln!(stderr, "snapshot: {snapshot}")?;
-    }
     Ok((stdout, stderr))
 }
 
@@ -399,11 +394,10 @@ async fn emit(response: &Response, json: bool) -> Result<()> {
     Ok(())
 }
 
-fn interrupted(signal: Interrupt, snapshot: Option<String>) -> Response {
+fn interrupted(signal: Interrupt) -> Response {
     let mut response = Response::error(
         "operation interrupted; inspect any resource being written before retrying",
     );
-    response.snapshot = snapshot;
     response.exit_code = signal.exit_code();
     response
 }
@@ -434,7 +428,7 @@ async fn run() -> Result<u8> {
         signal = signals.recv() => {
             let signal = signal?;
             interruption = Some(signal);
-            interrupted(signal, None)
+            interrupted(signal)
         }
         result = async {
             let operation = operation(cli.command).await?;
@@ -442,12 +436,8 @@ async fn run() -> Result<u8> {
                 Some(root) => root,
                 None => Workspace::discover_root(&std::env::current_dir()?).await?,
             };
-            let workspace = if cli.snapshot.is_some() {
-                Workspace::for_replay(&root).await?
-            } else {
-                Workspace::open(&root).await?
-            };
-            Ok::<_, anyhow::Error>(operations::execute(workspace, cli.snapshot.as_deref(), operation, &mut host).await)
+            let workspace = Workspace::open(&root).await?;
+            Ok::<_, anyhow::Error>(operations::execute(workspace, operation, &mut host).await)
         } => result.unwrap_or_else(|error| Response::error(format!("{error:#}"))),
     };
 
@@ -467,7 +457,7 @@ async fn run() -> Result<u8> {
         }
     };
     if let Some(signal) = interruption {
-        response = interrupted(signal, response.snapshot);
+        response = interrupted(signal);
     }
     if let Err(error) = cleanup {
         response.ok = false;

@@ -2,7 +2,7 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 pub fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -105,6 +105,7 @@ impl Link {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Observation {
     pub id: String,
     pub resource: String,
@@ -177,22 +178,6 @@ pub struct Diagnostic {
     pub stage: String,
     pub subject: String,
     pub message: String,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Snapshot {
-    pub version: u32,
-    pub interpreter: String,
-    pub created_at: String,
-    pub root: String,
-    pub interpretation: Value,
-    pub observations: BTreeMap<String, Observation>,
-    /// Failures are persisted with successes; replay never silently retries live resources.
-    pub failures: BTreeMap<String, Diagnostic>,
-    pub sidecar: Option<crate::sidecar::SidecarState>,
-    /// Resource addresses actually requested by each selector, including absence
-    /// and acquisition failures. Metadata and contents are stored once per session.
-    pub resolution_reads: BTreeMap<String, BTreeSet<String>>,
 }
 
 /// The region payload is interpreted exclusively by external extensions.
