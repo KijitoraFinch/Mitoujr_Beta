@@ -1,4 +1,4 @@
-# 外部拡張API v1
+# 外部拡張API v1（現行実装）
 
 Link と注釈は Core が Sidecar に保存する。外部拡張は Resource の観測、Observation の解釈、
 Region の比較、注釈の検査、Link の取り込み・生成を提供する。
@@ -8,9 +8,16 @@ CLIの一回の実行中は、プロジェクトルート・拡張名・登録�
 過去の Observation や書き込み後の Observation を扱う場合も再利用する。各メッセージを標準入力・標準出力の
 JSON一行でやり取りし、送信時にflushする。ログは標準エラーへ出力する。
 
-観測・書き込み以外の操作は、渡された固定済みの Observation ・設定・入力から結果を計算する。
-Resource の現在の内容を読む操作は `observe`、書き込む操作は `commit` が担当する。
-同じ解釈の版と入力は同じ結果を返す。意味や解釈が変わる変更では `revision` を更新する。
+Observation を解釈の基礎とし、解決・比較では LS やプロジェクト設定などの外部状態も利用できる。
+現在の状態に対する解決を対象とし、操作中は関連ファイルが外部から変更されないと仮定する。
+拡張はバックエンドの更新を反映し、一貫した状態で結果を返す。
+Observation・解釈・外部状態を含む入力が同じとき、同じ意味の結果を返す。
+意味や解釈が変わる変更では `revision` を更新する。
+
+Core は必要な解決・比較を毎回要求する。キャッシュの利用を推奨するが、利用の有無・
+再利用の判定・更新方法は拡張が決める。結果の正しさはキャッシュを使う拡張が受け持つ。
+一つの CLI 操作中はプロセス内のキャッシュを利用できる。操作をまたいでキャッシュを保存する場合も、
+Observation 以外の入力の変更を含めて拡張が再利用を判断する。
 
 ## 登録
 
@@ -105,7 +112,8 @@ Observation には `id`・`resource`・`content_hash`・`size`・`observed_at`�
 
 拡張は `content_path` から固定済みのbytesを読む。このファイルは読み取り専用の入力として扱う。
 Coreが内容のhashを検証し、大きな内容を呼び出しごとにJSONへ埋め直す必要をなくしている。
-`resource` が示す現在のファイルを解釈中に再取得しない。
+解釈する対象はこの Observation の内容に対応させる。LS を使う場合も、対象の内容を合わせて扱う。
+LS などが使う関連ファイルや設定は、Observation として取得していなくても参照できる。
 
 ## Region の解決と比較
 
@@ -165,14 +173,18 @@ def handler(operation, data, context):
 
 `domain` は共通の比較規則を使う Region 表現を識別する。
 `identity` と `content` は任意のJSONで、Coreは内部の意味を解釈しない。
-Coreが読み取りを記録し、完成した Region に `observations` として依存する Observation IDを付ける。
+Coreが読み取りを記録し、完成した Region に `observations` として、その解決で渡した Observation IDを付ける。
 探索に使った設定や不在の Observation も含む。拡張はこのフィールドを返さない。
+この記録は、拡張が直接読むファイルや LS の外部状態を含む全入力の一覧ではない。
 `show` は `content` を表示する。文字列なら本文、それ以外ならJSONとして表示する。
 
-解決ごとに要求した Resource をsnapshotの `resolution_reads` に記録する。Observation のメタデータと内容は
-セッションに一度保存し、各解決にはその Resource の参照だけを残す。後で別の Resource が加わっても、
-保存した RegionSelector の再解決では元の依存だけを使う。再実行で依存を増減させる解決はエラーになる。
-未解決の RegionSelector をsnapshotで解決する場合も、そこに保存された Resource だけを要求できる。
+キャッシュした計算結果を使う場合も、結果に用いる Observation は各解決で `read` により取得する。
+同じ URI でも操作や保存済み入力が変われば Observation が変わるので、返された情報を使って再利用を判断する。
+取得済みの Observation を返す際に Core が Resource を再観測することはない。
+キャッシュにより不要になった探索など、観測要求の集合は呼び出しごとに変わってよい。
+
+現行の `--snapshot` が復元するのは Core が保存した Observation・Sidecar・設定である。
+拡張の外部状態は拡張自身が扱う。設計への変更点は [実装との差分](IMPLEMENTATION.md#設計との差分) に記載する。
 
 `compare` のinputは `{"left":Region,"right":Region}`。
 返す値は `"equal"`・`"contains"`・`"within"`・`"incomparable"` のいずれか。
@@ -184,6 +196,9 @@ Coreが読み取りを記録し、完成した Region に `observations` とし�
 `extension test --cases FILE` は実際の呼び出しを繰り返し、決定性、反射性、対称性、
 反対称性、推移性を検査する。caseは RegionSelector の JSON 配列で、失敗箇所は配列のindexで示す。
 同じdomainを扱う別拡張の RegionSelector も同じcase群で検査できる。
+繰り返した解決は拡張の比較操作で同じ Region かを調べ、読み取り記録の一致は要求しない。
+拡張内のキャッシュは有効なままであり、この試験は全入力の把握やキャッシュ更新の正しさを証明するものではない。
+推移律は拡張の契約に含み、Core が探索に利用するかは処理ごとに判断する。
 
 ## Link の取り込み
 
@@ -236,7 +251,7 @@ Link の注釈は `link.annotation`、両端の Region は `source.region` / `ta
 名前付きtargetは、それぞれのsnapshot の設定で展開する。
 追加の Region が不要なら `[]` を返す。
 Coreが Region を解決して `check` のinputに `regions:{"baseline":Region}` を加える。
-この仕組みで、注釈に保存した過去の基準との比較を行える。
+外部状態の扱いは、前述の `--snapshot` と同じである。
 
 `check` は判定の配列を返す。
 

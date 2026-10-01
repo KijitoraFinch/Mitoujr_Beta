@@ -21,7 +21,7 @@ python3 examples/demo.py
 
 デモは一時ディレクトリを作り、[試験用の外部拡張](tests/fixtures/sets_extension.py)を登録する。
 JSON のデータ行を Region として扱い、Sidecar の編集、問い合わせ、検査、変更案の保存と適用、
-外部への生成、Observation からの取り込み、過去の状態での再実行を検証する。
+外部への生成、Observation からの取り込み、保存した Observation を使った解決を検証する。
 `--directory /tmp/monika-demo` を渡すと、新規作成した作業ディレクトリを残せる。
 試験用拡張は Core に同梱される形式対応ではなく、テストとデモの設定から起動する。
 
@@ -124,15 +124,22 @@ ID・注釈だけの問い合わせでは Resource を取得しない。Region �
 
 ## Observation と結果
 
-各操作は使用した Observation と設定を `.monika/` に保存し、`snapshot` ID を返す。
+現在の状態に対する解決を対象とし、操作中は関連ファイルが外部から変更されないと仮定する。
+拡張は Observation に加えて LS やプロジェクト設定なども参照できる。
+解決・比較のキャッシュと更新は拡張が管理する。
+
+現行実装では、各操作は使用した Observation と設定を `.monika/` に保存し、`snapshot` ID を返す。
 Sidecar を読んだ操作では、その状態も保存する。
-`--snapshot ID` は保存した入力で再実行する。未取得の Resource や Sidecar の現在の内容へ切り替えない。
+`--snapshot ID` は Core が渡す Observation・Sidecar・設定を保存済みのものにする。
+Core は未取得の Resource を観測し直さず、現在の Sidecar も読み直さない。
+拡張が使う外部状態は拡張自身が扱う。
 
 `.monika/` の削除は Sidecar の Link を変更しない。ただし削除した過去の Observation の内容と snapshot は復元できない。
 Sidecar に保持する取り込み元のメタデータは、Observation の内容そのものを複製するものではない。
 編集の結果には適用後の `snapshot` と、適用前の `data.base_snapshot` がある。
 Resource への生成後の snapshot は生成先の Observation と Sidecar の状態を含む。
 保存した変更案の適用には、そこで参照した入力の保存済み内容も必要になる。
+履歴を VCS に委ねる設計への変更点は [実装との差分](IMPLEMENTATION.md#設計との差分) に記載する。
 
 `--json` と `request` の応答:
 
