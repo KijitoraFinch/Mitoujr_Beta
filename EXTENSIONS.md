@@ -9,7 +9,7 @@ CLIの一回の実行中は、プロジェクトルート・拡張名・登録�
 JSON一行でやり取りし、送信時にflushする。ログは標準エラーへ出力する。
 
 Observation を解釈の基礎とし、解決・比較では LS やプロジェクト設定などの外部状態も利用できる。
-現在の状態に対する解決を対象とし、操作中は関連ファイルが外部から変更されないと仮定する。
+各操作で必要な Resource を観測し、操作中は関連ファイルが外部から変更されないと仮定する。
 拡張はバックエンドの更新を反映し、一貫した状態で結果を返す。
 Observation・解釈・外部状態を含む入力が同じとき、同じ意味の結果を返す。
 意味や解釈が変わる変更では `revision` を更新する。
@@ -46,7 +46,7 @@ Observation 以外の入力の変更を含めて拡張が再利用を判断す�
 Coreはファイルパスを `file:` URIに変換できるが、その内容の観測と書き込みは拡張に委ねる。
 パス指定では親ディレクトリを標準ライブラリで解決し、末尾のファイル名を保持してURIへ変換する。
 親ディレクトリは存在している必要がある。URI指定は `url` クレートのURL規則に従い、
-再利用時に現在のファイルシステムでアドレスを置き換えない。
+再利用時も同じアドレスとして扱う。
 
 `names` は名前からtargetへの対応。target は RegionSelector、または `{"name":"別の名前"}`。
 `checks` は注釈検査に使う拡張と、その拡張が解釈する任意のoptions。
@@ -247,7 +247,7 @@ Link の注釈は `link.annotation`、両端の Region は `source.region` / `ta
 [{"name":"baseline","target":{"extension":"sets","resource":"baseline.json","query":"2"}}]
 ```
 
-Core は同じ操作内の Observation を使って解決し、名前付き target は現在の設定で展開する。
+Core は同じ操作内の Observation を使って解決し、名前付き target は対象プロジェクトの設定で展開する。
 追加の Region が不要なら `[]` を返す。
 Coreが Region を解決して `check` のinputに `regions:{"baseline":Region}` を加える。
 
