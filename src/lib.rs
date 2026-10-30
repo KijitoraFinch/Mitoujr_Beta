@@ -1,5 +1,4 @@
 pub mod cancellation;
-pub mod editing;
 pub mod engine;
 pub mod extension_test;
 pub mod extensions;
@@ -7,6 +6,7 @@ pub mod links;
 pub mod model;
 mod observations;
 pub mod operations;
-pub mod query;
 pub mod sidecar;
+pub mod storage;
+pub mod stream;
 pub mod workspace;

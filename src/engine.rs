@@ -2,12 +2,11 @@ use crate::extensions::process::ResolutionEvent;
 use crate::extensions::process::{self, Manifest};
 use crate::model::{Diagnostic, Observation, Region, RegionSelector, Relation, ResourceState};
 use crate::observations::ReadScope;
-use crate::workspace::Session;
+use crate::workspace::{ObservationPolicy, Session};
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
-use url::Url;
 
 pub struct Engine<'host> {
     pub session: Session,
@@ -94,15 +93,64 @@ impl<'host> Engine<'host> {
             .await
     }
 
-    pub async fn observe(&mut self, resource: &str) -> Result<Observation> {
-        let resource = self.session.workspace.resource(resource).await?;
+    /// Select the Resource's current Observation according to its own policy.
+    pub async fn current(&mut self, resource: &str) -> Result<Observation> {
+        let resource = self.session.workspace.normalize_resource(resource).await?;
         if let Some(observation) = self.session.observations.get(&resource) {
             return Ok(observation.clone());
         }
         if let Some(failure) = self.session.failures.get(&resource) {
             bail!("{}", failure.message);
         }
-        let url = Url::parse(&resource)?;
+        if self.session.workspace.observation_policy(&resource) == ObservationPolicy::Observe {
+            return self.observe(&resource).await;
+        }
+        let result: Result<Observation> = async {
+            if self.session.saved_current.is_none() {
+                self.session.saved_current =
+                    Some(crate::storage::current(&self.session.workspace).await?);
+            }
+            let index = self
+                .session
+                .saved_current
+                .as_ref()
+                .expect("current index loaded");
+            let id = index.get(&resource).with_context(|| {
+                format!(
+                    "refreshed Resource has no saved Observation: {resource}; run monika refresh"
+                )
+            })?;
+            let (observation, bytes) =
+                crate::storage::observation(&self.session.workspace, id).await?;
+            ensure!(
+                observation.resource == resource,
+                "saved Observation Resource mismatch: {resource}"
+            );
+            self.session.adopt(observation, bytes)
+        }
+        .await;
+        if let Err(error) = &result {
+            self.session.failures.insert(
+                resource.clone(),
+                Diagnostic {
+                    stage: "current".into(),
+                    subject: resource,
+                    message: format!("{error:#}"),
+                },
+            );
+        }
+        result
+    }
+
+    pub async fn observe(&mut self, resource: &str) -> Result<Observation> {
+        let resource = self.session.workspace.normalize_resource(resource).await?;
+        if let Some(observation) = self.session.observations.get(&resource) {
+            return Ok(observation.clone());
+        }
+        if let Some(failure) = self.session.failures.get(&resource) {
+            bail!("{}", failure.message);
+        }
+        let url = self.session.workspace.observation_uri(&resource)?;
         let result = (async {
             let name = self
                 .session
@@ -117,22 +165,25 @@ impl<'host> Engine<'host> {
                 self.manifest(&name).await?.supports("observe"),
                 "extension {name} does not support observe"
             );
+            let content_path = self.host.observation_output()?;
             let config = &self.session.workspace.config.extensions[&name];
             let result = self
                 .host
                 .worker(&self.session.workspace.root, &name, config)?
-                .observe(&resource)
+                .observe(url.as_str(), &content_path)
                 .await?;
             #[derive(serde::Deserialize)]
             #[serde(deny_unknown_fields)]
             struct Observed {
-                bytes: Vec<u8>,
                 state: ResourceState,
             }
             let result: Observed =
                 serde_json::from_value(result).context("invalid observe result")?;
+            let bytes = tokio::fs::read(&content_path)
+                .await
+                .context("read observed content")?;
             self.session
-                .record(resource.clone(), result.bytes, name, result.state)
+                .record(resource.clone(), bytes, name, result.state)
         })
         .await;
         if let Err(error) = &result {

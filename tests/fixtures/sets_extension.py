@@ -1,13 +1,10 @@
 """A real process extension used to exercise multi-observation interpretation."""
 
-import fcntl
 import hashlib
 import os
-import tempfile
 import json
 import pathlib
 import sys
-import time
 from urllib.parse import unquote_to_bytes, urlparse
 
 
@@ -43,30 +40,10 @@ def read_resource(resource):
     }}
 
 
-def decode(content):
-    if NAME == "binary":
-        if not content.startswith(b"\xff\0"):
-            raise ValueError("invalid binary header")
-        return json.loads(content[2:])
-    if NAME == "lines":
-        return {"links": [json.loads(line) for line in content.splitlines() if line.strip()]}
-    return json.loads(content)
-
-
-def encode(document):
-    if NAME == "binary":
-        return b"\xff\0" + json.dumps(document, ensure_ascii=False).encode()
-    if NAME == "lines":
-        return ("".join(json.dumps(link, ensure_ascii=False) + "\n" for link in document["links"])).encode()
-    return (json.dumps(document, ensure_ascii=False, indent=2) + "\n").encode()
-
-
 def query_for(selector, workspace):
     query = selector["query"]
     if isinstance(query, str) or query is None:
         resource = selector["resource"]
-        if not urlparse(resource).scheme:
-            resource = (workspace / resource).resolve().as_uri()
         return {"resources": [resource], "minimum": int(query or 0)}
     return query
 
@@ -77,13 +54,20 @@ def execute(operation, data, context):
         return {
             "name": NAME,
             "revision": "test-v1",
-            "operations": ["observe", "resolve", "compare", "import", "check_plan", "check", "generate", "commit"],
+            "operations": ["observe", "resolve", "compare", "check"],
             "domains": ["test.sets.v1"],
-            "description": "Select rows from multiple observed JSON resources",
+            "description": (
+                "Select numeric rows from JSON arrays. Selector: "
+                '{"extension":"sets","resource":"rows.json","query":"2"} '
+                "selects values >= 2. Alternatively query is "
+                '{"resources":["file:///project/rows.json"],"minimum":2}. '
+                'Content: {"count":number}. Annotation expected_count is checked against target count. '
+            ),
         }
     if operation == "observe":
         content, state = read_resource(data["resource"])
-        return {"bytes": list(content), "state": state}
+        pathlib.Path(data["content_path"]).write_bytes(content)
+        return {"state": state}
     if operation == "resolve":
         query = query_for(data["selector"], workspace)
         selected = []
@@ -114,63 +98,11 @@ def execute(operation, data, context):
         if left < right:
             return "within"
         return "incomparable"
-    if operation == "import":
-        links = decode(pathlib.Path(data["content_path"]).read_bytes())["links"]
-        return {"links": [{"link": link, "location": {"index": index}}
-                          for index, link in enumerate(links)],
-                "diagnostics": ([{"stage": "import", "subject": "fixture", "message": "incomplete input"}]
-                                if NAME == "partial" else [])}
-    if operation == "generate":
-        document = {"links": data["links"]}
-        if NAME == "tamper" and document["links"]:
-            document["links"][0]["annotation"] = {"changed": True}
-        return {"bytes": list(encode(document))}
-    if operation == "commit":
-        if NAME == "no_write":
-            _, state = read_resource(data["resource"])
-            return {"content_hash": data["replacement"]["content_hash"], "state": state}
-        path = resource_path(data["resource"])
-        lock_directory = workspace / ".monika" / "fixture-locks"
-        lock_directory.mkdir(parents=True, exist_ok=True)
-        lock_path = lock_directory / hashlib.sha256(data["resource"].encode()).hexdigest()
-        with lock_path.open("a") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            content, state = read_resource(data["resource"])
-            if state != data["expected"]["state"] or hashlib.sha256(content).hexdigest() != data["expected"]["content_hash"]:
-                raise ValueError("resource changed at commit")
-            if path.is_symlink():
-                raise ValueError("refuse to replace a symlink")
-            replacement = bytes(data["replacement"]["bytes"])
-            if hashlib.sha256(replacement).hexdigest() != data["replacement"]["content_hash"]:
-                raise ValueError("invalid replacement digest")
-            with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as staged:
-                staged.write(replacement)
-                staged.flush()
-                os.fsync(staged.fileno())
-                if path.exists():
-                    os.fchmod(staged.fileno(), path.stat().st_mode & 0o777)
-            os.replace(staged.name, path)
-            content, state = read_resource(data["resource"])
-            if NAME == "pause_after_commit":
-                marker = workspace / "commit-completed.json"
-                commits = json.loads(marker.read_text())["commits"] if marker.exists() else 0
-                staged_marker = marker.with_suffix(".tmp")
-                staged_marker.write_text(json.dumps({"commits": commits + 1, "pid": os.getpid()}))
-                staged_marker.replace(marker)
-                time.sleep(60)
-            return {"content_hash": hashlib.sha256(content).hexdigest(), "state": state}
-    if operation == "check_plan":
-        baseline = data["link"]["annotation"]
-        if isinstance(baseline, dict) and "baseline" in baseline:
-            return [{"name": "baseline", **baseline["baseline"]}]
-        return []
     if operation == "check":
         annotation = data["link"]["annotation"]
         if not isinstance(annotation, dict):
             return [{"status": "not_applicable", "code": "no_expectation", "message": "No count expectation"}]
         expected = annotation.get("expected_count")
-        if "baseline" in data["regions"]:
-            expected = data["regions"]["baseline"]["content"]["count"]
         if expected is None:
             return [{"status": "not_applicable", "code": "no_expectation", "message": "No count expectation"}]
         actual = data["target"]["region"]["content"]["count"]

@@ -3,7 +3,6 @@ use monika::engine::Engine;
 use monika::extensions::process::Host;
 use monika::model::RegionSelector;
 use monika::operations;
-use monika::query::Expression;
 use monika::workspace::{Config, ProcessExtension, Session, Workspace};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -88,8 +87,9 @@ async fn observation_files_survive_the_session_until_extension_cleanup_finishes(
         let dir = tempfile::tempdir()?;
         let workspace = workspace(dir.path(), false, 500).await?;
         fs::write(dir.path().join("rows.json"), "[1,2,3]")?;
-        let target =
-            selector(json!({"mode":mode,"resource":workspace.resource("rows.json").await?}));
+        let target = selector(
+            json!({"mode":mode,"resource":workspace.normalize_resource("rows.json").await?}),
+        );
         let mut host = Host::default();
         let mut engine = Engine::new(Session::new(workspace), &mut host)?;
         let result = engine.resolve(&target).await;
@@ -131,9 +131,9 @@ async fn reads_follow_content_and_pin_absence_during_the_operation() -> Result<(
         let dir = tempfile::tempdir()?;
         let workspace = workspace(dir.path(), split, 5_000).await?;
         let root = workspace.root.clone();
-        let entry = workspace.resource("entry.json").await?;
-        let rows = workspace.resource("rows.json").await?;
-        let optional = workspace.resource("optional.json").await?;
+        let entry = workspace.normalize_resource("entry.json").await?;
+        let rows = workspace.normalize_resource("rows.json").await?;
+        let optional = workspace.normalize_resource("optional.json").await?;
         fs::write(
             root.join("entry.json"),
             serde_json::to_vec(&json!({"next": rows}))?,
@@ -181,8 +181,8 @@ async fn unrelated_observations_do_not_enter_resolution_inputs_or_change_the_res
     for name in ["a.json", "b.json", "unrelated.json"] {
         fs::write(dir.path().join(name), "[1,2,3]")?;
     }
-    let a = workspace.resource("a.json").await?;
-    let b = workspace.resource("b.json").await?;
+    let a = workspace.normalize_resource("a.json").await?;
+    let b = workspace.normalize_resource("b.json").await?;
     let first = selector(json!({"resources":[a]}));
     let second = selector(json!({"resources":[b]}));
     let mut host = Host::default();
@@ -206,7 +206,7 @@ async fn unrelated_observations_do_not_enter_resolution_inputs_or_change_the_res
 async fn failed_reads_cannot_be_hidden_or_retried_within_a_session() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let workspace = workspace(dir.path(), true, 5_000).await?;
-    let resource = workspace.resource("unavailable.json").await?;
+    let resource = workspace.normalize_resource("unavailable.json").await?;
     let target = selector(json!({"mode":"ignore_failure","resource":resource}));
     let mut host = Host::default();
     let mut engine = Engine::new(Session::new(workspace.clone()), &mut host)?;
@@ -219,7 +219,11 @@ async fn failed_reads_cannot_be_hidden_or_retried_within_a_session() -> Result<(
     fs::write(dir.path().join("good.json"), "[7]")?;
     assert_eq!(
         engine
-            .resolve(&RegionSelector::parse("sets:good.json#0")?)
+            .resolve(&RegionSelector {
+                extension: "sets".into(),
+                resource: Some("good.json".into()),
+                query: json!("0")
+            })
             .await?
             .content["count"],
         1
@@ -245,7 +249,7 @@ async fn repeated_resolution_can_change_reads_without_changing_the_region() -> R
     fs::write(dir.path().join("a.json"), "[1]")?;
     fs::write(dir.path().join("b.json"), "[2]")?;
     let target = selector(json!({"mode":"changing_reads",
-        "resource":workspace.resource("a.json").await?, "extra":workspace.resource("b.json").await?}));
+        "resource":workspace.normalize_resource("a.json").await?, "extra":workspace.normalize_resource("b.json").await?}));
     let mut host = Host::default();
     let mut engine = Engine::new(Session::new(workspace), &mut host)?;
     let report = monika::extension_test::test_regions(&mut engine, &[target]).await?;
@@ -268,7 +272,7 @@ async fn repeated_resolution_can_change_reads_without_changing_the_region() -> R
 async fn extension_cache_tracks_backend_settings_and_current_observations() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let workspace = workspace(dir.path(), false, 5_000).await?;
-    let resource = workspace.resource("rows.json").await?;
+    let resource = workspace.normalize_resource("rows.json").await?;
     let target = selector(json!({"mode":"cached_project", "resource":resource}));
     let mut host = Host::default();
     let mut previous_id = None;
@@ -320,7 +324,7 @@ async fn a_later_resolution_calls_the_extension_after_an_operation_error() -> Re
     let workspace = workspace(dir.path(), false, 5_000).await?;
     fs::write(dir.path().join("rows.json"), "[1]")?;
     let target = selector(json!({"mode":"transient_failure",
-        "resource":workspace.resource("rows.json").await?}));
+        "resource":workspace.normalize_resource("rows.json").await?}));
     let mut host = Host::default();
     let mut engine = Engine::new(Session::new(workspace), &mut host)?;
     assert!(
@@ -356,8 +360,8 @@ async fn core_records_observation_reads_and_batch_reads_are_scoped() -> Result<(
     let workspace = workspace(dir.path(), false, 5_000).await?;
     fs::write(dir.path().join("a.json"), "[1]")?;
     fs::write(dir.path().join("b.json"), "[2]")?;
-    let a = workspace.resource("a.json").await?;
-    let b = workspace.resource("b.json").await?;
+    let a = workspace.normalize_resource("a.json").await?;
+    let b = workspace.normalize_resource("b.json").await?;
     let mut host = Host::default();
     let mut engine = Engine::new(Session::new(workspace), &mut host)?;
     let region = engine
@@ -384,7 +388,7 @@ async fn resolution_deadline_includes_other_providers_and_repeated_read_requests
         let dir = tempfile::tempdir()?;
         let workspace = workspace(dir.path(), true, 400).await?;
         let mut query = query;
-        query["resource"] = workspace.resource("waiting.json").await?.into();
+        query["resource"] = workspace.normalize_resource("waiting.json").await?.into();
         let mut host = Host::default();
         let mut engine = Engine::new(Session::new(workspace), &mut host)?;
         let start = Instant::now();
@@ -403,8 +407,9 @@ async fn resolution_deadline_includes_other_providers_and_repeated_read_requests
 async fn cancellation_while_a_provider_is_pending_closes_both_processes() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let workspace = workspace(dir.path(), true, 5_000).await?;
-    let target =
-        selector(json!({"mode":"chain", "resource":workspace.resource("waiting.json").await?}));
+    let target = selector(
+        json!({"mode":"chain", "resource":workspace.normalize_resource("waiting.json").await?}),
+    );
     let mut host = Host::default();
     let mut engine = Engine::new(Session::new(workspace), &mut host)?;
     let mut resolving = Box::pin(engine.resolve(&target));
@@ -441,28 +446,30 @@ async fn cancellation_while_a_provider_is_pending_closes_both_processes() -> Res
 }
 
 #[tokio::test]
-async fn narrow_query_does_not_acquire_resources_or_start_extensions() -> Result<()> {
+async fn enumeration_does_not_acquire_resources_or_start_extensions() -> Result<()> {
     for count in [100, 600] {
         let dir = tempfile::tempdir()?;
         let workspace = workspace(dir.path(), false, 10_000).await?;
         let mut links = Vec::new();
         for i in 0..count {
             // These Resources intentionally do not exist.
-            let resource = workspace.resource(&format!("rows-{i:04}.json")).await?;
+            let resource = workspace
+                .normalize_resource(&format!("rows-{i:04}.json"))
+                .await?;
             let target = json!({"extension":"sets", "resource":resource, "query":"0"});
-            links.push(json!({"id":i.to_string(), "source":target, "reference":{"target":target},"annotation":null}));
+            links.push(
+                json!({"id":i.to_string(), "source":target, "target":target,"annotation":null}),
+            );
         }
         fs::write(
             dir.path().join("monika.links.json"),
-            serde_json::to_vec(&json!({"version":1,"revision":1,"links":links,"origins":[]}))?,
+            serde_json::to_vec(&json!({"version":1,"links":links}))?,
         )?;
         let mut host = Host::default();
         let mut engine = Engine::new(Session::new(workspace), &mut host)?;
-        let result =
-            operations::select(&mut engine, Some(&Expression::parse("id == \"0\"")?)).await?;
-        assert!(result.complete);
-        assert_eq!(result.links.len(), 1);
-        assert_eq!(result.links[0].id, "0");
+        let result = operations::links(&mut engine).await?;
+        assert_eq!(result.len(), count);
+        assert_eq!(result[0].id, "0");
         assert!(engine.session.observations.is_empty());
         host.shutdown(false).await?;
         assert!(

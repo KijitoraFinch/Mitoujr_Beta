@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Monika — [=] と色のスタジオ</title>
+  <link rel="stylesheet" href="preview.css">
+  <script src="preview-data.js" defer></script>
+  <script src="color.js" defer></script>
+  <script src="preview.js" defer></script>
+</head>
+<body data-background="white">
+  <main>
+    <header class="page-header">
+      <div><div class="eyebrow">MONIKA / LOGO STUDIES 02</div><h1><span class="header-mark" aria-hidden="true">[<span>=</span>]</span> 六つの表情。</h1><p>括弧と二本線。その形と色を、並べて探る。</p></div>
+      <nav aria-label="参考資料"><a href="brackets.png">六案の台紙 ↗</a><a href="round1.html">初回の三案 ↗</a></nav>
+    </header>
+    <div class="workspace">
+      <aside class="palette" aria-label="OKLCH の色調整">
+        <div class="panel-title"><h2>色をつくる</h2><span class="tag">OKLCH</span></div>
+        <div id="color-controls"></div>
+        <p class="gamut-help">表示と保存は sRGB。色域を超えた指定は、明るさと色相を保って鮮やかさを調整します。</p>
+        <button class="reset-all" type="button" id="reset-colors">色を初期値に戻す</button>
+        <p class="persistence">色の設定は URL に残ります。</p>
+      </aside>
+      <section class="comparison" aria-label="六案の比較">
+        <div class="view-controls">
+          <fieldset><legend>配色</legend><div class="segments"><button type="button" data-mode="accent" aria-pressed="true">アクセントあり</button><button type="button" data-mode="mono" aria-pressed="false">単色</button></div></fieldset>
+          <fieldset><legend>背景</legend><div class="segments"><button type="button" data-background="white" aria-pressed="true">白</button><button type="button" data-background="checker" aria-pressed="false">市松</button><button type="button" data-background="dark" aria-pressed="false">暗色</button></div></fieldset>
+          <label class="font-label" for="font">書体 <select id="font"><option value="mono">Mono Medium</option><option value="medium">Sans Medium</option><option value="semibold">Sans SemiBold</option></select></label>
+        </div>
+        <div class="studies" id="studies"></div>
+        <p class="export-status" id="export-status" role="status" aria-live="polite"></p>
+      </section>
+    </div>
+    <footer><p>IBM Plex の実際の輪郭を使用。SVG／PNG は透明背景で、現在の色・配色・書体を保存します。</p><a href="README.md">素材と制作メモ ↗</a></footer>
+  </main>
+  <noscript>色の調整には JavaScript を有効にしてください。<a href="brackets.png">六案の台紙</a>もあります。</noscript>
+</body>
+</html>

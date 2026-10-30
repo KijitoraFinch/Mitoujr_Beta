@@ -48,24 +48,12 @@ impl Manifest {
                 "a region extension must declare its comparison domains"
             );
         }
-        if self.supports("check") {
-            ensure!(
-                self.supports("check_plan"),
-                "a checker must provide check_plan and check"
-            );
-        }
-        if self.supports("generate") {
-            ensure!(
-                self.supports("import"),
-                "a generator must provide import for round-trip validation"
-            );
-        }
-        if self.supports("commit") {
-            ensure!(
-                self.supports("observe"),
-                "a writer must provide observe and commit"
-            );
-        }
+        ensure!(
+            self.operations
+                .iter()
+                .all(|op| matches!(op.as_str(), "observe" | "resolve" | "compare" | "check")),
+            "unsupported extension operation in manifest"
+        );
         ensure!(
             self.domains.iter().all(|domain| !domain.is_empty()),
             "empty comparison domain"
@@ -123,9 +111,19 @@ enum State {
 pub struct Host {
     workers: BTreeMap<(PathBuf, String, String), Worker>,
     inputs: BTreeMap<String, tempfile::NamedTempFile>,
+    outputs: Vec<tempfile::NamedTempFile>,
 }
 
 impl Host {
+    pub(crate) fn observation_output(&mut self) -> Result<PathBuf> {
+        let file = tempfile::Builder::new()
+            .prefix("monika-observe-")
+            .tempfile()?;
+        let path = file.path().to_owned();
+        self.outputs.push(file);
+        Ok(path)
+    }
+
     pub(crate) async fn observation_input(
         &mut self,
         observation: &Observation,
@@ -179,7 +177,10 @@ impl Host {
             .filter_map(Result::err)
             .map(|error| format!("{error:#}"))
             .collect();
-        for file in std::mem::take(&mut self.inputs).into_values() {
+        for file in std::mem::take(&mut self.inputs)
+            .into_values()
+            .chain(std::mem::take(&mut self.outputs))
+        {
             if let Err(error) = file.close() {
                 errors.push(format!("remove Observation input: {error}"));
             }
@@ -297,10 +298,13 @@ impl Worker {
     }
 
     // A resolver awaiting a read must also serve observe when it is the provider.
-    pub(crate) async fn observe(&mut self, resource: &str) -> Result<Value> {
+    pub(crate) async fn observe(&mut self, resource: &str, content_path: &Path) -> Result<Value> {
         self.available()?;
-        self.invoke_inner("observe", json!({"resource": resource}))
-            .await
+        self.invoke_inner(
+            "observe",
+            json!({"resource": resource, "content_path": content_path}),
+        )
+        .await
     }
 
     async fn invoke_inner(&mut self, operation: &str, input: Value) -> Result<Value> {

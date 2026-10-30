@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+<title id="title">Monika C2 — 軽やかのマーク</title>
+<desc id="desc">背景は透明。</desc>
+<g fill="none" stroke-width="6" stroke-linejoin="miter">
+    <path d="M31 19H19V77H31M65 19H77V77H65" stroke="#303234" />
+    <path d="M34 40H62M34 56H62" stroke="#303234" />
+  </g>
+
+</svg>

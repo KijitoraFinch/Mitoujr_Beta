@@ -37,8 +37,8 @@ async fn real_process_resolves_multiple_observations_and_fresh_sessions_observe_
     fs::write(dir.path().join("a.json"), "[1,2,3]")?;
     fs::write(dir.path().join("b.json"), "[2,4]")?;
     let workspace = configure(dir.path()).await?;
-    let a = workspace.resource("a.json").await?;
-    let b = workspace.resource("b.json").await?;
+    let a = workspace.normalize_resource("a.json").await?;
+    let b = workspace.normalize_resource("b.json").await?;
     let selector = |minimum| RegionSelector {
         extension: "sets".into(),
         resource: None,
@@ -71,8 +71,8 @@ async fn process_observation_freezes_external_resource_and_reports_failure() -> 
     fs::write(dir.path().join("external.json"), "[42]")?;
     let workspace = configure(dir.path()).await?;
     let resource = workspace
-        .resource("external.json")
-        .await?
+        .observation_uri("external.json")?
+        .as_str()
         .replacen("file:", "fixture:", 1);
     let mut engine = Engine::new(Session::new(workspace), &mut host)?;
     let observed = engine.observe(&resource).await?;
@@ -82,8 +82,8 @@ async fn process_observation_freezes_external_resource_and_reports_failure() -> 
     let missing = engine
         .session
         .workspace
-        .resource("missing.json")
-        .await?
+        .observation_uri("missing.json")?
+        .as_str()
         .replacen("file:", "fixture:", 1);
     assert!(!engine.observe(&missing).await?.state.exists);
     assert!(
@@ -158,7 +158,11 @@ async fn empty_configuration_has_no_builtin_extensions_or_observation_provider()
     for name in ["file", "text", "md", "sidecar", "rust", "ts", "python"] {
         assert!(
             engine
-                .resolve(&RegionSelector::parse(&format!("{name}:sample.md"))?)
+                .resolve(&RegionSelector {
+                    extension: name.into(),
+                    resource: Some("sample.md".into()),
+                    query: json!(null)
+                })
                 .await
                 .is_err()
         );
@@ -183,8 +187,8 @@ async fn external_regions_obey_comparison_laws_including_empty_and_multi_resourc
     fs::write(dir.path().join("rows.json"), "[1,2,3,4]")?;
     fs::write(dir.path().join("more.json"), "[2,5]")?;
     let workspace = configure(dir.path()).await?;
-    let resource = workspace.resource("rows.json").await?;
-    let other = workspace.resource("more.json").await?;
+    let resource = workspace.normalize_resource("rows.json").await?;
+    let other = workspace.normalize_resource("more.json").await?;
     let mut selectors: Vec<_> = [0, 2, 3, 6]
         .into_iter()
         .map(|minimum| RegionSelector {
@@ -222,7 +226,7 @@ async fn separate_extensions_share_a_comparison_domain_via_explicit_provider() -
     let dir = tempfile::tempdir()?;
     fs::write(dir.path().join("rows.json"), "[1,2,3]")?;
     let mut workspace = configure(dir.path()).await?;
-    let resource = workspace.resource("rows.json").await?;
+    let resource = workspace.normalize_resource("rows.json").await?;
     let mut second = extension();
     second.command.push("second".into());
     second.schemes.clear();
@@ -315,47 +319,6 @@ async fn worker_timeout_covers_a_blocked_stdin_write() -> Result<()> {
         .unwrap_err();
     assert!(error.to_string().contains("timed out"), "{error:#}");
     assert!(started.elapsed() < std::time::Duration::from_secs(2));
-    host.shutdown(false).await?;
-    Ok(())
-}
-
-#[tokio::test]
-async fn import_interprets_the_observation_even_after_the_resource_changes() -> Result<()> {
-    use monika::editing::{self, Destination};
-    let dir = tempfile::tempdir()?;
-    let workspace = Workspace::open(dir.path()).await?;
-    workspace.initialize().await?;
-    let workspace = configure(dir.path()).await?;
-    let link = json!({"id":"frozen","source":{"extension":"sets","resource":"rows.json","query":"0"},
-        "reference":{"target":{"extension":"sets","resource":"rows.json","query":"2"}},"annotation":{"state":"original"}});
-    fs::write(
-        dir.path().join("input.json"),
-        serde_json::to_vec(&json!({"links":[link]}))?,
-    )?;
-    let mut host = process::Host::default();
-    let mut engine = Engine::new(Session::new(workspace.clone()), &mut host)?;
-    let observed = engine.observe("input.json").await?;
-    fs::write(
-        dir.path().join("input.json"),
-        "changed after observing; no longer JSON",
-    )?;
-    let patch = editing::prepare_import(
-        &mut engine,
-        &Destination {
-            resource: "input.json".into(),
-            extension: "sets".into(),
-        },
-    )
-    .await?;
-    let result = editing::apply(&mut engine, &patch).await?;
-    let state = monika::sidecar::read(&workspace).await?;
-    assert_eq!(state.data.links[0].annotation, link["annotation"]);
-    assert_eq!(state.data.observations.len(), 1);
-    assert_eq!(state.data.origins[0].observation, observed.id);
-    assert_eq!(result["sidecar"], state.content_hash.unwrap());
-    assert_eq!(engine.session.sidecar().await?.data.links, state.data.links);
-    assert_eq!(engine.session.observations[&observed.resource], observed);
-    assert!(!dir.path().join(".monika").exists());
     host.shutdown(false).await?;
     Ok(())
 }

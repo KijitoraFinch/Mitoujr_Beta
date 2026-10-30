@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+<title id="title">Monika — かがり目のマーク</title>
+<desc id="desc">背景は透明。</desc>
+<g fill="#303234">
+    <rect x="16" y="16" width="9" height="64" rx="1.5" />
+    <rect x="71" y="16" width="9" height="64" rx="1.5" />
+  </g>
+  
+<path d="M20.5 31 48 58.5 75.5 31" fill="none" stroke="#22F765" stroke-width="9" stroke-linejoin="round" />
+
+</svg>

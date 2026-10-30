@@ -2,7 +2,7 @@ use crate::model::{Diagnostic, Observation, ResourceState, Target, require_versi
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
@@ -20,6 +20,16 @@ pub struct Config {
     pub comparators: BTreeMap<String, String>,
     #[serde(default)]
     pub checks: Vec<CheckSpec>,
+    #[serde(default)]
+    pub resources: BTreeMap<String, ObservationPolicy>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservationPolicy {
+    #[default]
+    Observe,
+    Refreshed,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -54,6 +64,7 @@ impl Default for Config {
             extensions: BTreeMap::new(),
             comparators: BTreeMap::new(),
             checks: Vec::new(),
+            resources: BTreeMap::new(),
         }
     }
 }
@@ -95,9 +106,7 @@ pub struct Workspace {
 
 impl Workspace {
     pub async fn open(root: &Path) -> Result<Self> {
-        let root = fs::canonicalize(root)
-            .await
-            .with_context(|| format!("open workspace {}", root.display()))?;
+        let root = lexical_path(&std::env::current_dir()?.join(root))?;
         ensure!(
             fs::metadata(&root).await?.is_dir(),
             "workspace is not a directory: {}",
@@ -110,7 +119,17 @@ impl Workspace {
             Err(error) => return Err(error).context("read monika.json"),
         };
         config.validate()?;
-        Ok(Self { root, config })
+        let mut workspace = Self { root, config };
+        let mut resources = BTreeMap::new();
+        for (resource, policy) in &workspace.config.resources {
+            let resource = workspace.normalize_resource(resource).await?;
+            ensure!(
+                resources.insert(resource.clone(), *policy).is_none(),
+                "duplicate Resource policy after normalization: {resource}"
+            );
+        }
+        workspace.config.resources = resources;
+        Ok(workspace)
     }
 
     pub async fn discover(start: &Path) -> Result<Self> {
@@ -142,27 +161,23 @@ impl Workspace {
             !fs::try_exists(self.root.join(crate::sidecar::FILE_NAME)).await?,
             "Sidecar already exists"
         );
-        let sidecar = crate::sidecar::SidecarState {
-            content_hash: None,
-            data: crate::sidecar::Sidecar::default(),
-        };
+        let sidecar = serde_json::to_vec_pretty(&crate::sidecar::Sidecar::default())?;
         self.publish_new(&path, &bytes).await?;
-        let mut initial = sidecar.data.clone();
-        initial.revision = 1;
-        crate::sidecar::commit(self, &sidecar, &initial).await?;
+        self.publish_new(&self.root.join(crate::sidecar::FILE_NAME), &sidecar)
+            .await?;
         Ok(path)
     }
 
-    pub async fn resource(&self, input: &str) -> Result<String> {
+    pub async fn normalize_resource(&self, input: &str) -> Result<String> {
         ensure!(!input.is_empty(), "resource is empty");
         // Recognize native absolute paths before URL parsing (including Windows drives).
         if Path::new(input).has_root() {
-            return self.path_resource(Path::new(input)).await;
+            return self.normalize_path(Path::new(input)).await;
         }
         let url = match Url::parse(input) {
             Ok(url) => url,
             Err(url::ParseError::RelativeUrlWithoutBase) => {
-                return self.path_resource(Path::new(input)).await;
+                return self.normalize_path(Path::new(input)).await;
             }
             Err(error) => return Err(error).context("invalid resource URL"),
         };
@@ -175,38 +190,82 @@ impl Workspace {
                 url.query().is_none(),
                 "file resource URL cannot contain a query"
             );
-            url.to_file_path()
+            let path = url
+                .to_file_path()
                 .map_err(|_| anyhow::anyhow!("invalid file URL: {input}"))?;
+            return self.normalize_path(&path).await;
         }
-        // A saved URI is already an address. Do not consult the live filesystem
-        // when it is reused, including after its parent directory has disappeared.
         Ok(url.into())
     }
 
-    pub(crate) async fn path_resource(&self, path: &Path) -> Result<String> {
-        let path = self.root.join(path);
-        // Resolve parents through the OS: lexically removing `..` changes the
-        // destination after a symlink. Keep the leaf so providers can create a
-        // missing file or apply their own policy to a symlink at the destination.
-        let resolved = match path.file_name() {
-            Some(name) => fs::canonicalize(path.parent().context("resource path has no parent")?)
-                .await
-                .with_context(|| format!("resolve resource parent: {}", path.display()))?
-                .join(name),
-            None => fs::canonicalize(&path)
-                .await
-                .with_context(|| format!("resolve resource path: {}", path.display()))?,
-        };
-        Url::from_file_path(&resolved)
-            .map(|url| url.to_string())
-            .map_err(|_| anyhow::anyhow!("invalid resource path: {}", path.display()))
+    pub(crate) async fn normalize_path(&self, path: &Path) -> Result<String> {
+        let absolute = lexical_path(&self.root.join(path))?;
+        let relative = absolute.strip_prefix(&self.root).with_context(|| {
+            format!(
+                "Resource path is outside the project root: {}",
+                path.display()
+            )
+        })?;
+        let text = relative
+            .to_str()
+            .context("Resource path must be valid UTF-8")?;
+        if text.is_empty() {
+            return Ok(".".into());
+        }
+        let text = text.replace(std::path::MAIN_SEPARATOR, "/");
+        // A colon in the first component must remain a local path on reuse.
+        Ok(if text.split('/').next().unwrap().contains(':') {
+            format!("./{text}")
+        } else {
+            text
+        })
+    }
+
+    pub fn observation_policy(&self, resource: &str) -> ObservationPolicy {
+        self.config
+            .resources
+            .get(resource)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    /// Only the observation provider receives the machine-specific file URI.
+    pub fn observation_uri(&self, resource: &str) -> Result<Url> {
+        if let Ok(url) = Url::parse(resource) {
+            return Ok(url);
+        }
+        Url::from_file_path(self.root.join(resource))
+            .map_err(|_| anyhow::anyhow!("invalid Resource path: {resource}"))
     }
 
     pub fn file_path(&self, resource: &str) -> Result<PathBuf> {
-        let url = Url::parse(resource)?;
+        let url = self.observation_uri(resource)?;
         ensure!(url.scheme() == "file", "not a file resource: {resource}");
         url.to_file_path()
             .map_err(|_| anyhow::anyhow!("not a local file resource: {resource}"))
+    }
+
+    pub(crate) async fn replace(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let staged = tempfile::NamedTempFile::new_in(path.parent().context("file has no parent")?)?;
+        match fs::symlink_metadata(path).await {
+            Ok(metadata) => {
+                ensure!(
+                    metadata.is_file() && !metadata.is_symlink(),
+                    "expected a regular file: {}",
+                    path.display()
+                );
+                staged.as_file().set_permissions(metadata.permissions())?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        let mut output = fs::File::from_std(staged.reopen()?);
+        output.write_all(bytes).await?;
+        output.sync_all().await?;
+        drop(output);
+        let destination = path.to_owned();
+        tokio::task::spawn_blocking(move || staged.persist(destination)).await??;
+        Ok(())
     }
 
     /// Publish a fully written file without replacing an existing destination.
@@ -226,6 +285,20 @@ impl Workspace {
     }
 }
 
+fn lexical_path(path: &Path) -> Result<PathBuf> {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                ensure!(result.pop(), "path escapes its root: {}", path.display());
+            }
+            part => result.push(part.as_os_str()),
+        }
+    }
+    Ok(result)
+}
+
 pub fn timestamp() -> String {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -239,7 +312,9 @@ pub struct Session {
     pub observations: BTreeMap<String, Observation>,
     pub failures: BTreeMap<String, Diagnostic>,
     pub(crate) sidecar: Option<crate::sidecar::SidecarState>,
+    pub(crate) saved_current: Option<BTreeMap<String, String>>,
     bytes: BTreeMap<String, Vec<u8>>,
+    observation_resources: BTreeMap<String, String>,
 }
 
 impl Session {
@@ -249,7 +324,9 @@ impl Session {
             observations: BTreeMap::new(),
             failures: BTreeMap::new(),
             sidecar: None,
+            saved_current: None,
             bytes: BTreeMap::new(),
+            observation_resources: BTreeMap::new(),
         }
     }
 
@@ -266,9 +343,27 @@ impl Session {
         );
         let observation = Observation::new(resource.clone(), &bytes, timestamp(), provider, state);
         observation.verify(&bytes)?;
+        self.adopt(observation, bytes)
+    }
+
+    pub fn adopt(&mut self, observation: Observation, bytes: Vec<u8>) -> Result<Observation> {
+        ensure!(
+            !self.observations.contains_key(&observation.resource)
+                && !self.failures.contains_key(&observation.resource),
+            "Resource already has a current Observation: {}",
+            observation.resource
+        );
+        observation.verify(&bytes)?;
         self.bytes.insert(observation.id.clone(), bytes);
-        self.observations.insert(resource, observation.clone());
+        self.observation_resources
+            .insert(observation.id.clone(), observation.resource.clone());
+        self.observations
+            .insert(observation.resource.clone(), observation.clone());
         Ok(observation)
+    }
+
+    pub fn observation(&self, id: &str) -> &Observation {
+        &self.observations[&self.observation_resources[id]]
     }
 
     pub fn bytes(&self, observation: &Observation) -> Result<&[u8]> {
@@ -293,23 +388,43 @@ mod tests {
         for name in ["new file.links", "日本語#100%?.links", "colon:name.links"] {
             let path = parent.join(name);
             let relative = Path::new("資料").join(name);
-            let resource = workspace.resource(relative.to_str().unwrap()).await?;
+            let resource = workspace
+                .normalize_resource(relative.to_str().unwrap())
+                .await?;
             assert_eq!(workspace.file_path(&resource)?, path);
-            assert_eq!(workspace.resource(path.to_str().unwrap()).await?, resource);
-            assert_eq!(workspace.resource(&resource).await?, resource);
+            assert_eq!(
+                workspace.normalize_resource(path.to_str().unwrap()).await?,
+                resource
+            );
+            assert_eq!(workspace.normalize_resource(&resource).await?, resource);
         }
-        let saved = workspace.resource("資料/new.links").await?;
+        let saved = workspace.normalize_resource("資料/new.links").await?;
         fs::remove_dir(&parent).await?;
-        assert_eq!(workspace.resource(&saved).await?, saved);
-        // A missing directory must not be erased to select a different file.
-        assert!(workspace.resource("absent/../victim.links").await.is_err());
-        assert!(workspace.resource("").await.is_err());
-        assert!(workspace.resource("https://[").await.is_err());
-        assert!(workspace.resource("file:///tmp/a?query").await.is_err());
-        assert!(workspace.resource("file:///tmp/a#fragment").await.is_err());
+        assert_eq!(workspace.normalize_resource(&saved).await?, saved);
+        // Normalization is lexical even when the directory does not exist.
+        assert!(
+            workspace
+                .normalize_resource("absent/../victim.links")
+                .await
+                .is_ok()
+        );
+        assert!(workspace.normalize_resource("").await.is_err());
+        assert!(workspace.normalize_resource("https://[").await.is_err());
+        assert!(
+            workspace
+                .normalize_resource("file:///tmp/a?query")
+                .await
+                .is_err()
+        );
+        assert!(
+            workspace
+                .normalize_resource("file:///tmp/a#fragment")
+                .await
+                .is_err()
+        );
         assert!(workspace.file_path("https://localhost/a").is_err());
         assert_eq!(
-            workspace.resource("fixture:example").await?,
+            workspace.normalize_resource("fixture:example").await?,
             "fixture:example"
         );
         Ok(())
@@ -317,15 +432,59 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn file_uri_preserves_non_utf8_path_bytes() -> Result<()> {
-        use std::os::unix::ffi::OsStringExt;
+    async fn normalization_is_lexical_across_symlinks_and_rejects_outside_paths() -> Result<()> {
         let dir = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
         let workspace = Workspace::open(dir.path()).await?;
-        let name = std::ffi::OsString::from_vec(b"note-\xff.links".to_vec());
-        let resource = workspace.path_resource(Path::new(&name)).await?;
-        assert!(resource.contains("%FF"));
-        assert_eq!(workspace.file_path(&resource)?, workspace.root.join(name));
-        assert_eq!(workspace.resource(&resource).await?, resource);
+        std::os::unix::fs::symlink(outside.path(), workspace.root.join("alias"))?;
+        assert_eq!(
+            workspace.normalize_resource("alias/../rows.json").await?,
+            "rows.json"
+        );
+        assert_eq!(
+            workspace.normalize_resource("alias/missing.json").await?,
+            "alias/missing.json"
+        );
+        assert!(
+            workspace
+                .normalize_resource("../outside.json")
+                .await
+                .is_err()
+        );
+        assert!(
+            workspace
+                .normalize_resource(outside.path().to_str().unwrap())
+                .await
+                .is_err()
+        );
+        let path = workspace.root.join("資料 #?%/rows.json");
+        let uri = Url::from_file_path(path).unwrap();
+        assert_eq!(
+            workspace.normalize_resource(uri.as_str()).await?,
+            "資料 #?%/rows.json"
+        );
+        assert_eq!(
+            workspace.normalize_resource("./colon:name").await?,
+            "./colon:name"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_explicit_workspace_root_keeps_its_lexical_path() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::create_dir(dir.path().join("actual")).await?;
+        std::os::unix::fs::symlink(dir.path().join("actual"), dir.path().join("alias"))?;
+        let root = dir.path().join("alias");
+        let workspace = Workspace::open(&root).await?;
+        assert_eq!(workspace.root, root);
+        assert_eq!(
+            workspace
+                .normalize_resource(root.join("missing/file").to_str().unwrap())
+                .await?,
+            "missing/file"
+        );
         Ok(())
     }
 

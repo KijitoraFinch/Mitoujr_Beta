@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="96" height="96" viewBox="0 0 96 96" role="img" aria-labelledby="title desc">
+<title id="title">Monika — 組み合う帯のマーク</title>
+<desc id="desc">背景は透明。</desc>
+<g transform="translate(7 7) scale(.854166667)" fill="none" stroke-width="11" stroke-linejoin="round">
+    <path d="M62 45V50Q62 62 50 62H26Q14 62 14 50V26Q14 14 26 14H50Q62 14 62 26" stroke="#303234" />
+    <path d="M34 51V46Q34 34 46 34H70Q82 34 82 46V70Q82 82 70 82H46Q34 82 34 70" stroke="#22F765" />
+  </g>
+
+</svg>

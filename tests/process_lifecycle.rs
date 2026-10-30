@@ -238,7 +238,6 @@ fn cli(root: &Path) -> Command {
     command
         .arg("--root")
         .arg(root)
-        .arg("--json")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -251,7 +250,7 @@ fn cli(root: &Path) -> Command {
 async fn signals_interrupt_stdin_without_waiting_for_eof() -> Result<()> {
     let dir = tempfile::tempdir()?;
     for (signal, code) in [(libc::SIGINT, 130), (libc::SIGTERM, 143)] {
-        let mut child = cli(dir.path()).arg("request").spawn()?;
+        let mut child = cli(dir.path()).arg("read").spawn()?;
         // Fill beyond the pipe buffer to synchronize with the CLI's first read.
         // The request remains incomplete and stdin stays open throughout exit.
         let mut stdin = child.stdin.take().unwrap();
@@ -274,9 +273,8 @@ async fn signals_interrupt_stdin_without_waiting_for_eof() -> Result<()> {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        let response: Value = serde_json::from_slice(&output.stdout)?;
-        assert_eq!(response["ok"], false);
-        assert!(response["error"].as_str().unwrap().contains("interrupted"));
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("interrupted"));
     }
     Ok(())
 }
@@ -358,10 +356,10 @@ async fn interruption_removes_observation_inputs_after_stopping_the_extension() 
     tokio::fs::write(dir.path().join("monika.json"), serde_json::to_vec(&config)?).await?;
     tokio::fs::write(dir.path().join("rows.json"), b"[1,2,3]").await?;
     let workspace = monika::workspace::Workspace::open(dir.path()).await?;
-    let request = json!({"op":"show","target":{"extension":"sets","query":{
-        "mode":"hold_input","resource":workspace.resource("rows.json").await?
-    }}});
-    let mut child = cli(dir.path()).arg("request").spawn()?;
+    let request = json!({"extension":"sets","query":{
+        "mode":"hold_input","resource":workspace.normalize_resource("rows.json").await?
+    }});
+    let mut child = cli(dir.path()).arg("read").spawn()?;
     child
         .stdin
         .take()
@@ -393,56 +391,60 @@ async fn interruption_removes_observation_inputs_after_stopping_the_extension() 
 
 #[cfg(unix)]
 #[tokio::test]
-async fn interruption_after_commit_reports_uncertainty_and_does_not_repeat_the_write() -> Result<()>
-{
+async fn read_emits_a_record_before_stdin_eof() -> Result<()> {
+    use tokio::io::{AsyncBufReadExt, BufReader};
     let dir = tempfile::tempdir()?;
-    let config = json!({"version":1,"extensions":{"pause_after_commit":{
-        "command":["python3", format!("{}/tests/fixtures/sets_extension.py", env!("CARGO_MANIFEST_DIR")), "pause_after_commit"],
+    let config = json!({"version":1,"extensions":{"sets":{
+        "command":["python3",format!("{}/tests/fixtures/sets_extension.py",env!("CARGO_MANIFEST_DIR"))],
         "revision":"test-v1","schemes":["file"]
     }}});
     tokio::fs::write(dir.path().join("monika.json"), serde_json::to_vec(&config)?).await?;
-    let resource = url::Url::from_file_path(dir.path().canonicalize()?.join("rows.json"))
-        .unwrap()
-        .to_string();
-    let link = json!({"id":"one","source":{"extension":"sets","resource":resource,"query":"0"},
-        "reference":{"target":{"extension":"sets","resource":resource,"query":"1"}},
-        "annotation":{"note":"saved before interruption"}});
+    tokio::fs::write(dir.path().join("rows.json"), b"[1,2,3]").await?;
+    let mut child = cli(dir.path()).arg("read").spawn()?;
+    let mut stdin = child.stdin.take().unwrap();
+    let mut output = BufReader::new(child.stdout.take().unwrap()).lines();
+    stdin
+        .write_all(b"{\"extension\":\"sets\",\"resource\":\"rows.json\",\"query\":\"2\"}\n")
+        .await?;
+    let line = timeout(Duration::from_secs(3), output.next_line())
+        .await??
+        .context("missing first record")?;
+    let value: Value = serde_json::from_str(&line)?;
+    assert_eq!(value["region"]["content"]["count"], 2);
+    // stdin is still open: the first result cannot depend on reading the batch.
+    stdin
+        .write_all(b"{\"extension\":\"sets\",\"resource\":\"rows.json\",\"query\":\"3\"}\n")
+        .await?;
+    let line = timeout(Duration::from_secs(3), output.next_line())
+        .await??
+        .context("missing second record")?;
+    assert_eq!(
+        serde_json::from_str::<Value>(&line)?["region"]["content"]["count"],
+        1
+    );
+    drop(stdin);
+    let result = timeout(Duration::from_secs(3), child.wait_with_output()).await??;
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn broken_output_pipe_exits_with_an_error() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let link = json!({"id":"one","source":{"extension":"example"},"target":{"extension":"example"},"annotation":"x".repeat(1_000_000)});
     tokio::fs::write(
         dir.path().join("monika.links.json"),
-        serde_json::to_vec(&json!({"version":1,"revision":1,"links":[link],"origins":[]}))?,
+        serde_json::to_vec(&json!({"version":1,"links":[link]}))?,
     )
     .await?;
-    let child = cli(dir.path())
-        .args(["generate", "new.links", "--extension", "pause_after_commit"])
-        .spawn()?;
-    let marker = dir.path().join("commit-completed.json");
-    timeout(Duration::from_secs(5), async {
-        while !tokio::fs::try_exists(&marker).await? {
-            sleep(Duration::from_millis(10)).await;
-        }
-        Ok::<_, anyhow::Error>(())
-    })
-    .await??;
-    // SAFETY: this PID belongs to the live CLI spawned above.
-    assert_eq!(
-        unsafe { libc::kill(child.id().unwrap() as libc::pid_t, libc::SIGTERM) },
-        0
-    );
+    let mut child = cli(dir.path()).arg("links").spawn()?;
+    drop(child.stdout.take());
     let output = timeout(Duration::from_secs(3), child.wait_with_output()).await??;
-    assert_eq!(output.status.code(), Some(143));
-    let response: Value = serde_json::from_slice(&output.stdout)?;
-    assert_eq!(response["ok"], false);
-    assert!(
-        response["error"]
-            .as_str()
-            .unwrap()
-            .contains("inspect any resource being written")
-    );
-    let state: Value = serde_json::from_slice(&tokio::fs::read(&marker).await?)?;
-    assert_eq!(state["commits"], 1);
-    wait_until_gone(state["pid"].as_i64().unwrap() as libc::pid_t).await?;
-    let saved: Value =
-        serde_json::from_slice(&tokio::fs::read(dir.path().join("new.links")).await?)?;
-    assert_eq!(saved["links"], json!([link]));
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("JSON output"));
     Ok(())
 }

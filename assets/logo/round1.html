@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Monika — ロゴの三案</title>
+  <style>
+    @font-face { font-family: Plex; src: url("fonts/IBMPlexSans-Medium.ttf"); font-weight: 500; }
+    :root { color-scheme: light; --ink: #303234; --muted: #69716d; --line: #d8ddd6; --paper: #f7f8f5; --green: #22f765; --logo-width: 350px; }
+    * { box-sizing: border-box; }
+    body { margin: 0; color: var(--ink); background: var(--paper); font-family: Plex, "Hiragino Sans", sans-serif; font-weight: 500; }
+    main { max-width: 1520px; margin: auto; padding: 52px 48px 40px; }
+    header { display: flex; justify-content: space-between; align-items: baseline; gap: 24px; }
+    h1 { font-size: 46px; margin: 0; letter-spacing: -.035em; }
+    h2 { margin: 12px 0 0; font-size: 24px; font-weight: 500; }
+    p { line-height: 1.8; }
+    .eyebrow { color: var(--muted); font-size: 11px; letter-spacing: .12em; }
+    .intro { color: var(--muted); margin: 12px 0 28px; font-size: 14px; }
+    .controls { padding: 18px 0; border-block: 1px solid var(--line); display: flex; gap: 28px; align-items: center; flex-wrap: wrap; }
+    fieldset { border: 0; padding: 0; margin: 0; display: flex; align-items: center; gap: 6px; }
+    legend { float: left; margin-right: 10px; font-size: 12px; color: var(--muted); }
+    button { font: inherit; font-size: 12px; padding: 7px 12px; border-radius: 4px; border: 1px solid transparent; background: transparent; color: var(--ink); cursor: pointer; }
+    button[aria-pressed="true"] { border-color: var(--ink); background: var(--ink); color: white; }
+    button:focus-visible, a:focus-visible, input:focus-visible { outline: 3px solid #117731; outline-offset: 4px; }
+    .scale { display: flex; gap: 10px; align-items: center; font-size: 12px; color: var(--muted); }
+    input { accent-color: var(--ink); width: 110px; }
+    output { min-width: 40px; }
+    .studies { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 32px; margin-top: 38px; }
+    article { min-width: 0; }
+    .study-label { font-size: 12px; letter-spacing: .09em; color: var(--muted); }
+    .study-label b { color: var(--ink); font-size: 17px; margin-right: 10px; font-weight: 500; }
+    .stage { height: 320px; margin-top: 22px; display: flex; flex-direction: column; align-items: center; justify-content: space-evenly; padding: 16px 6px; }
+    .checker .stage, .checker .sizes { background-color: #fff; background-image: conic-gradient(#edf0ea 25%, transparent 0 50%, #edf0ea 0 75%, transparent 0); background-size: 20px 20px; }
+    .white .stage, .white .sizes { background: #fff; }
+    .mark { width: 144px; height: 144px; }
+    .lockup { width: min(var(--logo-width), 100%); height: auto; }
+    .description { color: var(--muted); font-size: 13px; margin: 18px 0 24px; }
+    .small-label { font-size: 10px; color: var(--muted); letter-spacing: .1em; }
+    .sizes { min-height: 92px; display: flex; gap: 22px; align-items: baseline; padding: 16px 12px; margin-top: 12px; }
+    .size { display: flex; align-items: baseline; gap: 6px; }
+    .size span { font-size: 10px; color: var(--muted); }
+    .downloads { display: flex; gap: 18px; margin: 18px 0; }
+    a { color: var(--ink); text-underline-offset: 4px; font-size: 12px; }
+    .type-section { margin-top: 44px; border-top: 1px solid var(--line); padding-top: 22px; }
+    summary { cursor: pointer; font-size: 15px; padding: 8px 0; }
+    .type-section img { width: 100%; max-width: 1100px; display: block; margin: 20px auto 0; }
+    footer { border-top: 1px solid var(--line); margin-top: 32px; padding-top: 22px; display: flex; gap: 24px; align-items: center; flex-wrap: wrap; color: var(--muted); font-size: 11px; }
+    .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -2px; margin-right: 7px; background: var(--ink); }
+    .green { background: var(--green); }
+    footer p { margin: 0; }
+    @media (max-width: 980px) {
+      main { padding: 32px 24px; }
+      .studies { gap: 20px; }
+      .sizes { gap: 12px; flex-wrap: wrap; }
+      .size { gap: 3px; }
+      .description { min-height: 48px; }
+      h2 { font-size: 20px; }
+    }
+    @media (max-width: 720px) {
+      header { align-items: center; }
+      h1 { font-size: 38px; }
+      .eyebrow { font-size: 9px; }
+      .controls { gap: 14px; }
+      .studies { grid-template-columns: 1fr; gap: 34px; }
+      article + article { padding-top: 30px; border-top: 1px solid var(--line); }
+      .stage { height: 290px; }
+      .description { min-height: 0; }
+      .sizes { gap: 26px; }
+    }
+    @media (prefers-reduced-motion: no-preference) { .lockup { transition: width .12s ease; } }
+  </style>
+</head>
+<body class="checker">
+<main>
+  <header><h1>Monika</h1><span class="eyebrow">LOGO STUDIES / 01</span></header>
+  <p class="intro">IBM Plex と、Link を表す三つの案。背景と色を切り替えて見比べられます。</p>
+  <div class="controls" aria-label="比較表示の設定">
+    <fieldset><legend>配色</legend><button type="button" data-color="accent" aria-pressed="true">グリーンを添える</button><button type="button" data-color="mono" aria-pressed="false">黒一色</button></fieldset>
+    <fieldset><legend>背景</legend><button type="button" data-bg="checker" aria-pressed="true">透明を確認</button><button type="button" data-bg="white" aria-pressed="false">白</button></fieldset>
+    <label class="scale" for="size">ロゴの幅 <input id="size" type="range" min="100" max="380" step="10" value="350"><output for="size">350 px</output></label>
+  </div>
+  <div class="studies">
+    <article data-study="a-stitch">
+      <div class="study-label"><b>A</b> STITCH</div><h2>かがり目</h2>
+      <div class="stage"><img class="mark" src="exports/a-stitch-mark-accent.svg" alt="二つの縁と、それを渡る M 字の糸"><img class="lockup" src="exports/a-stitch-accent.svg" alt="Monika — かがり目"></div>
+      <p class="description">二つの縁を渡る糸。M の形に関係を残す。</p>
+      <div class="small-label">SMALL SIZES</div><div class="sizes">
+        <div class="size"><img src="exports/a-stitch-mark-accent.svg" width="16" height="16" alt="16 px"><span>16</span></div>
+        <div class="size"><img src="exports/a-stitch-mark-accent.svg" width="24" height="24" alt="24 px"><span>24</span></div>
+        <div class="size"><img src="exports/a-stitch-mark-accent.svg" width="32" height="32" alt="32 px"><span>32</span></div>
+        <div class="size"><img src="exports/a-stitch-mark-accent.svg" width="48" height="48" alt="48 px"><span>48</span></div>
+      </div>
+      <div class="downloads"><a href="exports/a-stitch-accent.svg" download data-kind="logo">ロゴ SVG</a><a href="exports/a-stitch-accent.png" download data-kind="png">透過 PNG</a><a href="exports/a-stitch-mark-accent.svg" download data-kind="mark">マーク SVG</a></div>
+    </article>
+    <article data-study="b-weave">
+      <div class="study-label"><b>B</b> WEAVE</div><h2>組み合う帯</h2>
+      <div class="stage"><img class="mark" src="exports/b-weave-mark-accent.svg" alt="交互に重なり合う二本の帯"><img class="lockup" src="exports/b-weave-accent.svg" alt="Monika — 組み合う帯"></div>
+      <p class="description">独立した二本の帯が、交互に重なり合う。</p>
+      <div class="small-label">SMALL SIZES</div><div class="sizes">
+        <div class="size"><img src="exports/b-weave-mark-accent.svg" width="16" height="16" alt="16 px"><span>16</span></div>
+        <div class="size"><img src="exports/b-weave-mark-accent.svg" width="24" height="24" alt="24 px"><span>24</span></div>
+        <div class="size"><img src="exports/b-weave-mark-accent.svg" width="32" height="32" alt="32 px"><span>32</span></div>
+        <div class="size"><img src="exports/b-weave-mark-accent.svg" width="48" height="48" alt="48 px"><span>48</span></div>
+      </div>
+      <div class="downloads"><a href="exports/b-weave-accent.svg" download data-kind="logo">ロゴ SVG</a><a href="exports/b-weave-accent.png" download data-kind="png">透過 PNG</a><a href="exports/b-weave-mark-accent.svg" download data-kind="mark">マーク SVG</a></div>
+    </article>
+    <article data-study="c-compare">
+      <div class="study-label"><b>C</b> COMPARE</div><h2>照合する印</h2>
+      <div class="stage"><img class="mark" src="exports/c-compare-mark-accent.svg" alt="向き合う括弧と二本の対応線"><img class="lockup" src="exports/c-compare-accent.svg" alt="Monika — 照合する印"></div>
+      <p class="description">向き合う括弧と、対応を示す二本の線。</p>
+      <div class="small-label">SMALL SIZES</div><div class="sizes">
+        <div class="size"><img src="exports/c-compare-mark-accent.svg" width="16" height="16" alt="16 px"><span>16</span></div>
+        <div class="size"><img src="exports/c-compare-mark-accent.svg" width="24" height="24" alt="24 px"><span>24</span></div>
+        <div class="size"><img src="exports/c-compare-mark-accent.svg" width="32" height="32" alt="32 px"><span>32</span></div>
+        <div class="size"><img src="exports/c-compare-mark-accent.svg" width="48" height="48" alt="48 px"><span>48</span></div>
+      </div>
+      <div class="downloads"><a href="exports/c-compare-accent.svg" download data-kind="logo">ロゴ SVG</a><a href="exports/c-compare-accent.png" download data-kind="png">透過 PNG</a><a href="exports/c-compare-mark-accent.svg" download data-kind="mark">マーク SVG</a></div>
+    </article>
+  </div>
+  <details class="type-section"><summary>IBM Plex の書体も見比べる</summary><img src="typography.svg" alt="同じ文字の高さで並べた Sans Medium、Sans SemiBold、Mono Medium の Monika"></details>
+  <footer>
+    <span><i class="swatch"></i>#303234</span><span><i class="swatch green"></i>oklch(85.4% 0.2441 147.4)</span>
+    <p>ロゴ素材は透明背景。三案とも IBM Plex Sans Medium。</p>
+    <a href="comparison.png">比較台紙 PNG</a><a href="typography.png">書体比較 PNG</a>
+  </footer>
+</main>
+<script>
+  const colorButtons = [...document.querySelectorAll('[data-color]')];
+  const backgroundButtons = [...document.querySelectorAll('[data-bg]')];
+  colorButtons.forEach(button => button.addEventListener('click', () => {
+    const color = button.dataset.color;
+    colorButtons.forEach(item => item.setAttribute('aria-pressed', String(item === button)));
+    document.querySelectorAll('[data-study]').forEach(article => {
+      const stem = article.dataset.study;
+      article.querySelectorAll('img').forEach(img => {
+        img.src = `exports/${stem}${img.classList.contains('lockup') ? '' : '-mark'}-${color}.svg`;
+      });
+      article.querySelectorAll('[data-kind]').forEach(link => {
+        const kind = link.dataset.kind;
+        link.href = `exports/${stem}${kind === 'mark' ? '-mark' : ''}-${color}.${kind === 'png' ? 'png' : 'svg'}`;
+      });
+    });
+  }));
+  backgroundButtons.forEach(button => button.addEventListener('click', () => {
+    backgroundButtons.forEach(item => item.setAttribute('aria-pressed', String(item === button)));
+    document.body.className = button.dataset.bg;
+  }));
+  document.querySelector('#size').addEventListener('input', event => {
+    document.documentElement.style.setProperty('--logo-width', `${event.target.value}px`);
+    document.querySelector('output').textContent = `${event.target.value} px`;
+  });
+</script>
+</body>
+</html>

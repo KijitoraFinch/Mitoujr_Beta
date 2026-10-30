@@ -1,332 +1,141 @@
-# 外部拡張API v1（現行実装）
+# 外部拡張 API v1
 
-Link と注釈は Core が Sidecar に保存する。外部拡張は Resource の観測、Observation の解釈、
-Region の比較、注釈の検査、Link の取り込み・生成を提供する。
+Link と注釈の正本は Core が管理する Sidecar です。外部拡張は Resource の観測、Observation からの Region の解決、Region の比較、注釈の検査を提供します。同梱のファイル・Markdown・コード拡張はまだありません。`tests/fixtures/sets_extension.py` は試験用の作例です。
 
-拡張は、JSON LinesでCoreと通信する独立した実行プログラム。
-CLIの一回の実行中は、プロジェクトルート・拡張名・登録設定が同じプロセスを再利用する。
-各メッセージを標準入力・標準出力の
-JSON一行でやり取りし、送信時にflushする。ログは標準エラーへ出力する。
+## 登録と Resource の表記
 
-Observation を解釈の基礎とし、解決・比較では LS やプロジェクト設定などの外部状態も利用できる。
-各操作で必要な Resource を観測し、操作中は関連ファイルが外部から変更されないと仮定する。
-拡張はバックエンドの更新を反映し、一貫した状態で結果を返す。
-Observation・解釈・外部状態を含む入力が同じとき、同じ意味の結果を返す。
-意味や解釈が変わる変更では `revision` を更新する。
-
-Core は必要な解決・比較を毎回要求する。キャッシュの利用を推奨するが、利用の有無・
-再利用の判定・更新方法は拡張が決める。結果の正しさはキャッシュを使う拡張が受け持つ。
-一つの CLI 操作中はプロセス内のキャッシュを利用できる。操作をまたいでキャッシュを保存する場合も、
-Observation 以外の入力の変更を含めて拡張が再利用を判断する。
-
-## 登録
-
-プロジェクトルートの `monika.json` で登録する。
-コマンドはシェルを介さず起動し、作業ディレクトリにはルートを使う。
+プロジェクトルートの `monika.json` に登録します。コマンドはシェルを介さず起動し、作業ディレクトリはルートです。
 
 ```json
 {
   "version": 1,
   "extensions": {
     "sets": {
-      "command": ["python3", "/absolute/path/to/sets_extension.py"],
+      "command": ["python3", "extensions/sets.py"],
       "revision": "test-v1",
       "schemes": ["file"],
       "timeout_ms": 30000
     }
   },
-  "names": {},
-  "comparators": {},
-  "checks": [{"extension": "sets", "options": null}]
+  "names": {"all": {"extension":"sets", "resource":"rows.json", "query":"0"}},
+  "resources": {"expensive.json":"refreshed", "rows.json":"observe"},
+  "comparators": {"test.sets.v1":"sets"},
+  "checks": [{"extension":"sets", "options":null}]
 }
 ```
 
-`schemes` は観測を担当する Resource URIのschemeで、一つのschemeには一つの提供元を登録する。
-登録がなければ、そのschemeの取得はエラーになる。`file` も明示的な登録が必要。
-Coreはファイルパスを `file:` URIに変換できるが、その内容の観測と書き込みは拡張に委ねる。
-パス指定では親ディレクトリを標準ライブラリで解決し、末尾のファイル名を保持してURIへ変換する。
-親ディレクトリは存在している必要がある。URI指定は `url` クレートのURL規則に従い、
-再利用時も同じアドレスとして扱う。
+`schemes` は観測を担当する URI scheme です。一つの scheme に一つの提供元を登録し、`file` も明示的に登録します。`names` は名前から RegionSelector または `{"name":"別の名前"}` への対応です。`checks` は注釈検査の拡張と、その拡張が解釈する任意の `options` です。`comparators` は Region の domain から比較担当の拡張への対応で、同じ domain を扱う拡張が複数ある場合に指定します。
 
-`names` は名前からtargetへの対応。target は RegionSelector、または `{"name":"別の名前"}`。
-`checks` は注釈検査に使う拡張と、その拡張が解釈する任意のoptions。
-`comparators` は Region のdomainから比較を担当する拡張名への対応。
-同じdomainを扱う拡張が複数ある場合には、比較の担当をここで明示する。
+展開は名前を RegionSelector に置き換える処理、正規化は `resource` の表記をそろえる処理です。Core はどちらも Resource の内容を取得せずに行います。ローカル Resource はルートからの相対パスを正規形とし、`.`・`..` を字句的に処理します。親ディレクトリの存在やシンボリックリンクを調べません。ルート外のパスはエラーです。絶対パスと `file:` URI も入力できますが、selector・Observation・出力・Capture の `resource` は相対パスになります。先頭の要素に `:` があるローカル名は `./colon:name` と指定します。パスは UTF-8 で表現します。
 
-## 通信
+ローカルパスを `file:` URI に変換するのは提供元へ観測を要求するときだけです。その他の URI は `url` クレートで正規化し、fragment は RegionSelector の `query` に分けます。Core は `query` の内部を解釈しません。複数 Resource を query に含む形式も、拡張側でルート相対パスを使うと共有できます。
 
-要求の例:
+## 通信と寿命
+
+拡張は JSON Lines で Core と通信する独立した実行プログラムです。一回の CLI 操作では、ルート・拡張名・登録設定が同じプロセスを再利用します。送信時に flush し、ログは標準エラーへ出します。
 
 ```json
 {"protocol":1,"id":1,"workspace":"/project","operation":"describe","input":null}
 ```
 
-操作の最終応答は同じ `id` を持ち、`result` または `error` のどちらかを返す。
-`result:null` も表現できる。`resolve` の途中では、下記の観測要求を送れる。
+最終応答には同じ `id` と `result` または `error` を返します。`result:null` も表現できます。
 
 ```json
-{"protocol":1,"id":1,"result":{"name":"sets","revision":"test-v1","operations":["observe","resolve","compare","import","generate","commit","check_plan","check"],"domains":["test.sets.v1"],"description":"JSON row sets and generated Link representations"}}
+{"protocol":1,"id":1,"result":{"name":"sets","revision":"test-v1","operations":["observe","resolve","compare","check"],"domains":["test.sets.v1"],"description":"Select numeric rows; query is a minimum value string; content is {count:number}."}}
 ```
 
 ```json
 {"protocol":1,"id":2,"error":"region not found"}
 ```
 
-`describe` が返す名前・revisionは登録内容と一致すること。Region を扱う拡張は
-`resolve`・`compare` を提供し、返す Region のdomainを宣言する。
-他の機能も `operations` に列挙した操作だけが呼び出せる。
+`describe` の名前と `revision` は登録内容と一致させます。`operations` に宣言できるのは `observe`・`resolve`・`compare`・`check` です。Region を扱う拡張は `resolve` と `compare` を提供し、返す domain を宣言します。注釈の検査だけの拡張は `check` だけを提供できます。`description` に query・content の形と具体例を記します。意味や解釈を変えるときは `revision` を更新します。
 
-timeoutは入力送信から応答取得までの全体に適用する。不正な応答、終了、timeout、途中のキャンセルで通信が壊れた場合は
-そのプロセスへの呼び出しを失敗させ、自動再起動・再試行をしない。
-通常の `error` 応答はその操作の失敗として扱う。
-`resolve` の期限には観測の要求と提供元の呼び出しも含まれ、往復のたびに期限を延長しない。
+期限は入力送信から応答取得までに適用され、解決途中の Resource 要求と別プロセスへの観測も含みます。往復ごとに期限を延長しません。通信破損・期限超過・中断ではプロセス群を終了し、自動再起動・再試行をしません。通常の `error` 応答はその操作の失敗です。
 
-通常終了ではCoreが標準入力を閉じる。拡張はEOFを受けて1秒以内に終了する。
-期限超過・中断・通信破損では、Coreが拡張のプロセス群を終了させ、終了結果を回収する。
-拡張が起動した補助プロセスも、同じプロセス群に置く。親が先に終了していても残る補助プロセスを終了させる。
-通常終了時の非ゼロ終了コードや終了期限の超過は、CLIの失敗として返す。
+通常終了では Core が標準入力を閉じ、拡張は EOF から 1 秒以内に終了します。補助プロセスも同じプロセス群に置いてください。Core は補助プロセスも終了させてから一時ファイルを削除します。終了失敗は CLI の失敗として返します。[Python の通信ヘルパー](examples/extension_api.py) はこの要求・応答と解決途中の Resource 要求を扱います。
 
-## 観測
+## 観測と現在の Observation
 
-`observe` のinputは `{"resource":"file:///project/a.json"}`。
-返す値は実際の内容のbyte配列と、Resource の状態。
+各 Resource の観測方針は `resources` に指定します。省略値は `observe` です。
+
+- `observe`：その操作で最初に必要になったときに観測します。
+- `refreshed`：`monika refresh` が最後に採用した保存済み Observation を使います。通常の操作では提供元を呼ばず、未保存ならエラーです。
+
+一操作中の同じ Resource には一つの Observation を共有します。解決中に要求された別の Resource にも、その Resource 自身の方針を適用します。
+
+提供元の `observe` の入力例です。
 
 ```json
-{"bytes":[91,49,93],"state":{"exists":true,"revision":"provider-owned-version"}}
+{"resource":"file:///project/rows.json","content_path":"/tmp/monika-observe-..."}
 ```
 
-存在しない Resource は `bytes:[]`、`state.exists:false` を返す。
-認証失敗や取得失敗は `error` を返す。Core は不存在と取得失敗を区別する。
-`revision` は任意のJSON値で、提供元が条件付き書き込みのために使う情報を保持できる。
-
-Coreは内容を固定して操作中に保持し、Observation を作る。
-Observation には `id`・`resource`・`content_hash`・`size`・`observed_at`・`provider`・`state` がある。
-`observed_at` はUnix epochからのnanosecondsの文字列。
-同じ Resource は操作中に一度観測し、以後はその Observation を使う。書き込み時の照合と適用後の確認は独立して観測する。
-
-解釈操作に渡す Observation は次の形になる。
+提供元は観測時点の実際の内容を、Core が用意した `content_path` に生の bytes として書き、書き込みを完了してから次を返します。
 
 ```json
-{"observation":{"id":"...","resource":"...","content_hash":"...","size":3,"observed_at":"...","provider":"sets","state":{"exists":true,"revision":"..."}},"content_path":"/tmp/monika-observation-..."}
+{"state":{"exists":true,"revision":"provider-owned-version"}}
 ```
 
-拡張は `content_path` から固定済みのbytesを読む。このファイルは読み取り専用の入力として扱う。
-Core は拡張プロセスの終了までファイルを保持し、その後に削除する。
-Coreが内容のhashを検証し、大きな内容を呼び出しごとにJSONへ埋め直す必要をなくしている。
-解釈する対象はこの Observation の内容に対応させる。LS を使う場合も、対象の内容を合わせて扱う。
-LS などが使う関連ファイルや設定は、Observation として取得していなくても参照できる。
+Resource 自体は変更しません。存在しない Resource は空の内容と `state.exists:false` を返します。認証失敗・取得失敗は `error` にします。`revision` は提供元が定める任意の JSON で、必須です。ETag などによる取得の省略は提供元内部で扱います。内容を JSON の整数配列では転送しません。
 
-## Region の解決と比較
+Core は内容を固定し、`id`・`resource`・`content_hash`・`size`・`observed_at`・`provider`・`state` を持つ Observation を作ります。時刻は Unix epoch からの nanoseconds の文字列です。`refreshed` はメタデータと生の内容を保存します。通常の `observe` は操作中だけ保持します。
 
-RegionSelector の形は `{"extension":"name","resource":"任意の指定","query":任意のJSON}`。
-`resource` は省略でき、`query` の省略値は `null`。
-Core は RegionSelector の `query` を解釈せず、指定された拡張へ渡す。
+## Region の解決
 
-`resolve` の input は `selector` に RegionSelector を持つ。
+RegionSelector は `{"extension":"name","resource":"rows.json","query":任意のJSON}` です。`resource` は省略でき、`query` の省略値は `null` です。`resolve` の入力は展開・正規化済みの selector です。
 
 ```json
-{"selector":{"extension":"sets","query":{"resources":["file:///project/a.json"]}}}
+{"selector":{"extension":"sets","resource":"rows.json","query":"2"}}
 ```
 
-拡張は必要な観測を、解決要求と同じ `id` の `read` メッセージで要求する。
-値は Resource URIの配列で、Coreは同じ順序の Observation を `read_result` に入れて返す。
-一つの観測要求の応答を受け取ってから、次の要求を送る。
+拡張は必要な Resource を、解決要求と同じ ID の `read` メッセージで要求します。ルート相対パスと URI を使えます。Core は同じ順序で Observation を返します。
 
 ```json
-{"protocol":1,"id":2,"read":["file:///project/a.json"]}
+{"protocol":1,"id":2,"read":["rows.json","service:experiment"]}
 ```
 
 ```json
-{"protocol":1,"id":2,"read_result":[{"observation":{"id":"...","resource":"file:///project/a.json","content_hash":"...","size":3,"observed_at":"...","provider":"sets","state":{"exists":true,"revision":"..."}},"content_path":"/tmp/monika-observation-..."}]}
+{"protocol":1,"id":2,"read_result":[{"observation":{"id":"...","resource":"rows.json","content_hash":"...","size":7,"observed_at":"...","provider":"sets","state":{"exists":true,"revision":"..."}},"content_path":"/tmp/monika-observation-..."},{"observation":{"id":"...","resource":"service:experiment","content_hash":"...","size":0,"observed_at":"...","provider":"service","state":{"exists":false,"revision":null}},"content_path":"/tmp/monika-observation-..."}]}
 ```
 
-Coreは要求された Observation だけを渡す。取得済みの Resource にはそのセッションの Observation を使い、
-未取得の Resource は登録した提供元の `observe` で観測する。拡張は返された内容を読み、
-そこから必要になった次の Resource を要求できる。
+拡張は `content_path` を読み取り専用の入力として扱います。Core は内容の hash を検証し、拡張終了までファイルを保持します。一回の応答を受けてから次の要求を送ってください。返された内容から必要な次の Resource を見つけて要求できます。失敗は `{"protocol":1,"id":2,"read_error":"理由"}` で返し、拡張がそのエラーを握り潰しても解決全体は失敗します。不在は有効な Observation で、必須か任意かは解決する拡張が判断します。
 
-不在も `state.exists:false` の Observation として渡す。その Resource が必要か、次の候補を調べるかは解決拡張が判断する。
-取得や入力検証に失敗した場合は `{"protocol":1,"id":2,"read_error":"理由"}` を返す。
-拡張は解決の `error` 応答を返して処理を終える。観測要求の失敗後に Region を返しても、Coreはその解決を成功扱いにしない。
-
-同じ拡張が提供元も兼ねる場合、観測の応答を待つ間にCoreから別の `id` の `observe` 要求が届く。
-その要求に応答すると、元の `id` の `read_result` が届き、解決を続けられる。
-一つの解決の観測要求は直列で処理し、同じプロセスで別の解決を並行して起動しない。
-
-[Pythonの通信ヘルパー](examples/extension_api.py)は、このやり取りと解決中の再参照のキャッシュを提供する。
-`Extension(handler).run()` で起動し、handler内では次のように観測を読む。
-
-```python
-def handler(operation, data, context):
-    # resolveの処理内。指定の解釈は拡張が担当する。
-    item = context.read(resource_uri)
-    if item["observation"]["state"]["exists"]:
-        content = pathlib.Path(item["content_path"]).read_bytes()
-```
-
-`context.read_many(resource_uris)` で複数の観測をまとめて要求できる。
-実行可能なhandler全体は [試験用拡張](tests/fixtures/sets_extension.py)にある。
-
-解決が完了したら、`result` として Region の意味を返す。
+同じプロセスが解決と観測を提供する場合、`read_result` 待ちの間に別 ID の `observe` 要求が届きます。観測への応答後に、元の解決の応答を待ちます。最終的な `resolve` の結果には次を返します。
 
 ```json
-{"domain":"test.sets.v1","identity":[["observation-id",0]],"content":{"count":1}}
+{"domain":"test.sets.v1","identity":[["Observation-ID",1]],"content":{"count":1}}
 ```
 
-`domain` は共通の比較規則を使う Region 表現を識別する。
-`identity` と `content` は任意のJSONで、Coreは内部の意味を解釈しない。
-Coreが読み取りを記録し、完成した Region に `observations` として、その解決で渡した Observation IDを付ける。
-探索に使った設定や不在の Observation も含む。拡張はこのフィールドを返さない。
-この記録は、拡張が直接読むファイルや LS の外部状態を含む全入力の一覧ではない。
-`show` は `content` を表示する。文字列なら本文、それ以外ならJSONとして表示する。
+`domain`・`identity`・`content` は必須です。`identity` と `content` は任意の JSON です。Core が、その解決で渡した Observation の ID 配列を `observations` に付けます。拡張からこの配列を返すことはできません。
 
-キャッシュした計算結果を使う場合も、結果に用いる Observation は各解決で `read` により取得する。
-同じ URI でも操作ごとに Observation が変わるので、返された情報を使って再利用を判断する。
-取得済みの Observation を返す際に Core が Resource を再観測することはない。
-キャッシュにより不要になった探索など、観測要求の集合は呼び出しごとに変わってよい。
+Core は同じ selector も毎回解決を要求します。拡張はキャッシュを使えますが、Observation と LS・設定などの外部状態を含めて再利用を判断します。各操作中は関連する Resource・設定を変更しない前提です。観測要求の集合が変わっても、同じ入力の意味に対して同じ Region を返してください。
 
-履歴は VCS や Resource の提供元が管理する。Core は履歴用に Observation を保存しない。
+Capture はこの解決結果そのものを固定します。後から解き直すことはありません。Core が現在との変化を検査する際には `content` のみを比べます。何を変化とみなすかを踏まえて `content` を設計してください。`identity` は時点をまたいだ比較に使いません。
 
-`compare` のinputは `{"left":Region,"right":Region}`。
-返す値は `"equal"`・`"contains"`・`"within"`・`"incomparable"` のいずれか。
-`contains` は左が右を真に包含すること、`within` はその逆。同一性は `equal` で返す。
-問い合わせの包含条件では `equal` も含める。失敗は `error` として返す。
-異なるdomainの比較規則が共有されていない場合、Coreは比較失敗として扱う。
+## 比較と検査
 
-比較は [拡張機能の法則](extension_concept.md) を満たす。
-`extension test --cases FILE` は実際の呼び出しを繰り返し、決定性、反射性、対称性、
-反対称性、推移性を検査する。caseは RegionSelector の JSON 配列で、失敗箇所は配列のindexで示す。
-同じdomainを扱う別拡張の RegionSelector も同じcase群で検査できる。
-繰り返した解決は拡張の比較操作で同じ Region かを調べ、読み取り記録の一致は要求しない。
-拡張内のキャッシュは有効なままであり、この試験は全入力の把握やキャッシュ更新の正しさを証明するものではない。
-推移律は拡張の契約に含み、Core が探索に利用するかは処理ごとに判断する。
+`compare` の入力は `{"left":Region,"right":Region}` です。戻り値は `equal`・`contains`・`within`・`incomparable` のいずれかの JSON 文字列です。`contains` は左が右を真に含み、`within` はその逆です。包含条件を調べるときは `equal` も含めます。比較不能という関係と処理失敗を区別し、失敗には `error` を返します。異なる domain の比較はエラーです。
 
-## Link の取り込み
+比較は [拡張機能の法則](extension_concept.md) を満たします。`monika extension test --cases FILE` は RegionSelector または名前付き指定の JSON 配列を展開・正規化し、決定性、反射性、対称性、反対称性、推移性を検査します。同じ domain を扱う別拡張も含められます。失敗箇所は配列の index で示します。繰り返した解決は比較操作で同一性を調べます。キャッシュは有効なままであり、依存関係やキャッシュ更新の完全性を証明する試験ではありません。
 
-`import` の input は一つの Observation と `content_path`。
-拡張は固定済みの内容から Link を読み取り、次の形で返す。
+注釈検査の `check` の入力は次の形です。
 
-```json
-{
-  "links": [{
-    "link": {
-      "id":"example",
-      "source":{"extension":"sets","resource":"rows.json","query":"0"},
-      "reference":{"target":{"name":"subset"}},
-      "annotation":{"review":{"owner":"利用者"}}
-    },
-    "location":{"index":0}
-  }],
-  "diagnostics":[]
-}
+```text
+{link: Link, source: {selector: RegionSelector, region: Region},
+ target: {selector: RegionSelector, region: Region}, options: JSON}
 ```
 
-`id` は必須。拡張は取り込みを繰り返しても同じ Link を指定できる ID を返す。
-`location` は Observation の中の位置を表す、拡張が定める JSON 値。
-Core が入力の Observation、拡張名と版、location を取り込み元として Sidecar に保存する。
-Observation のメタデータは ID ごとに共有する。
+`link` は展開・正規化済みで、注釈は `link.annotation`、端点の任意の Capture ID は `link.source.capture` / `link.target.capture` にあります。両端の解決に失敗すると `check` は呼ばれず、CLI は終了コード 2 になります。追加の解決計画を要求する操作はありません。
 
-返す RegionSelector は、その Observation から切り離しても解釈できる指定にする。
-例えば文書内の相対参照は、元の場所を反映した `resource` や `query` にする。
-Core は名前付き指定を展開し、RegionSelector の `resource` を正規化して登録する。
-
-解釈できない部分は `diagnostics` に `{"stage":"import","subject":"対象","message":"理由"}` を返す。
-diagnostics がある場合は登録全体を止める。同じ ID が既存の Link と食い違う場合も全体を適用しない。
-一致する Link の再取り込みは取り込み元だけを確認する。生成元の変更を自動で正本へ反映する処理はない。
-
-## 注釈の検査
-
-検査をする拡張は `check_plan` と `check` を提供する。
-各 input は `link`（Sidecar の一件の Link）、`source`・`target`（解決結果）、設定の `options` を持つ。
-Link の注釈は `link.annotation`、両端の Region は `source.region` / `target.region` にある。
-解決結果は `{"status":"resolved","selector":RegionSelector,"region":Region}`。
-両端を解決できない Link は Core の diagnostics に残し、注釈検査を開始しない。
-
-`check_plan` は追加で必要な Region の配列を返す。
-
-```json
-[{"name":"baseline","target":{"extension":"sets","resource":"baseline.json","query":"2"}}]
-```
-
-Core は同じ操作内の Observation を使って解決し、名前付き target は対象プロジェクトの設定で展開する。
-追加の Region が不要なら `[]` を返す。
-Coreが Region を解決して `check` のinputに `regions:{"baseline":Region}` を加える。
-
-`check` は判定の配列を返す。
+結果は次の判定の配列です。`status` は `pass`・`fail`・`not_applicable` です。取得・解釈の失敗は `error` にします。
 
 ```json
 [{"code":"count","status":"fail","message":"Expected 2, observed 3"}]
 ```
 
-statusは `pass`・`fail`・`not_applicable`。Coreは注釈の項目名や意味を決めない。
-検査に必要な入力の取得・解釈の失敗は、判定結果と区別してdiagnosticsに残す。
+Core は Capture と現在の `content` の比較も行い、変化または拡張の `fail` を終了コード 1 にします。端点の selector と Capture の selector の不一致は終了コード 2 です。
 
-## 生成と書き込み
+## 保存内容と費用
 
-生成する拡張は `generate` と、生成結果を読み戻すための `import` を提供する。
-`generate` の input は `observation`、`content_path`、`links`（選んだ Link の配列）。
-生成先が存在しない場合は Observation の `state.exists:false` で、内容は空。
+`.monika/captures/` は Region と Observation メタデータを、`.monika/observations/` は保存済み Observation のメタデータと生の bytes を持ちます。`.monika/current.json` は Resource から採用中の Observation ID への対応です。設定・Sidecar とともにコミットして共有します。保存内容には Resource の機密情報が含まれるため、コミット・共有前に確認してください。
 
-返す値は `{"bytes":[生成後のbyte列]}`。指定された Link をすべて表現する内容への置換案であり、
-この操作で外部の状態を書き換えない。Core は提案された内容を新たな Observation として固定し、
-同じ拡張の `import` で読み戻す。正規化後の Link の集合が指定と一致し、ID・ RegionSelector ・注釈が
-保持されていることを確認する。Sidecar と Monika の設定への生成は受け付けない。
-生成案には元にした Sidecar の状態も保存し、適用時にその状態が変わっていないことを確認する。
-
-Resource の書き込みを扱う提供元は `observe` と `commit` を提供する。
-生成と書き込みの提供元は別の拡張でもよい。Coreが保存済み内容と再観測した状態を照合した後、
-providerへ次を渡す。
-
-```json
-{
-  "resource":"file:///project/design.links",
-  "expected":{"content_hash":"old-sha256","state":{"exists":true,"revision":"old-version"}},
-  "replacement":{"content_hash":"new-sha256","bytes":[]},
-  "patch_id":"..."
-}
-```
-
-providerは自身の書き込み時点にもexpectedを確認し、条件が一致した場合に置換する。
-例えばサービスの条件付き更新を使う。ファイルを扱う試験用拡張はプロセス間のロックと
-再照合を行い、一時ファイルから置換する。外部編集者も含む同時更新の保証は提供元の機構に従う。
-
-成功時は `{"content_hash":"new-sha256","state":{"exists":true,"revision":"new-version"}}` を返す。
-Coreはさらに独立した観測で内容と状態を確認する。応答の喪失や異常終了時は書き込みが
-実行された可能性があるので、現状を取得して確認する。Coreから自動で再試行しない。
-
-## CLIと同じJSON操作
-
-`monika request` は次の形のオブジェクトを一つ読み、[READMEの応答形式](README.md#observation-と結果)で返す。
-`--root` は通常のCLIと共通。
-
-| op | 追加のフィールド |
-| --- | --- |
-| `init` | なし |
-| `show` | `target` |
-| `links` | 任意の `where` |
-| `check` | 任意の `where`、`duplicates`（省略時 false） |
-| `extension_list` | なし |
-| `extension_show` | `name` |
-| `extension_test` | `selectors` 配列 |
-| `edit` | `change`、任意の `patch_out` |
-| `import` | `source:{resource,extension}`、任意の `patch_out` |
-| `generate` | `destination:{resource,extension}`、任意の `where`・`patch_out` |
-| `apply` | 保存した `patch` オブジェクト |
-
-`edit` の `change` は `{"op":"add","link":Link}`、`{"op":"set","link":Link}`、
-`{"op":"remove","id":"Link ID"}` のいずれか。
-Sidecar の一件を ID で選び、Core が編集する。
-`patch_out` の省略時は適用し、指定時は保存する。`apply` は応答の `data.patch` と同じオブジェクトを受け取る。
-
-whereの構造化表現は次のとおり。
-
-```json
-{"op":"and","args":[
-  {"op":"compare","field":"annotation.relation","relation":"equal","value":{"kind":"json","value":"supports"}},
-  {"op":"compare","field":"target","relation":"within","value":{"kind":"region","value":{"name":"subset"}}}
-]}
-```
-
-booleanは `and` / `or` と `args`、`not` と `arg`。
-存在判定は `{"op":"exists","field":"annotation.review"}`。
-relationは `equal`・`not_equal`・`within`・`contains`、operandのkindは `json`・`region`・`region_selector`。
-CLI文字列の条件式と同じ評価処理を使う。
+Core は操作中の内容をメモリと一時ファイルに保持します。大きな Resource の部分取得は提供していません。解決ごとに内容を JSON へ埋め直さず、同じ Observation の入力ファイルを共有します。

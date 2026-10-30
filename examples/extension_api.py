@@ -1,7 +1,9 @@
 """JSON Lines transport for an external Monika extension.
 
 The handler receives (operation, input, context). During resolve it can call
-context.read(uri) or context.read_many(uris) to obtain frozen observations.
+context.read(resource) or context.read_many(resources) to obtain current
+Observations selected by Core. Local Resources use project-relative paths.
+An observe handler writes raw bytes to input["content_path"] and returns state.
 """
 
 import json

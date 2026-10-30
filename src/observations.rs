@@ -2,7 +2,6 @@ use crate::engine::Engine;
 use anyhow::{Result, ensure};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use url::Url;
 
 /// Observation reads made by one interpretation. These do not describe all of
 /// an extension's inputs: its backend may also use external state.
@@ -21,10 +20,12 @@ impl ReadScope {
         let result: Result<Vec<Value>> = async {
             let mut values = Vec::with_capacity(resources.len());
             for resource in resources {
-                // Extensions request Resource URIs; path interpretation belongs to the provider.
-                Url::parse(&resource)?;
-                let resource = engine.session.workspace.resource(&resource).await?;
-                let observation = engine.observe(&resource).await?;
+                let resource = engine
+                    .session
+                    .workspace
+                    .normalize_resource(&resource)
+                    .await?;
+                let observation = engine.current(&resource).await?;
                 self.observations.insert(observation.id.clone());
                 values.push(engine.observation_input(&observation).await?);
             }

@@ -1,154 +1,78 @@
-use crate::editing::{self, Change, Destination, Patch};
 use crate::engine::Engine;
-use crate::extension_test;
 use crate::links::Endpoint;
-use crate::model::{Diagnostic, Link, Observation, RegionSelector, Relation, Target};
-use crate::query::Expression;
-use crate::sidecar::Origin;
-use crate::workspace::{Session, Workspace};
+use crate::model::{Capture, Link, LinkEnd, Observation, Region, RegionSelector, Relation, Target};
+use crate::sidecar;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Deserialize)]
-#[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
-pub enum Operation {
-    Init,
-    Show {
-        target: Target,
-    },
-    Links {
-        #[serde(default, rename = "where")]
-        filter: Option<Expression>,
-    },
-    Check {
-        #[serde(default, rename = "where")]
-        filter: Option<Expression>,
-        #[serde(default)]
-        duplicates: bool,
-    },
-    ExtensionList,
-    ExtensionShow {
-        name: String,
-    },
-    ExtensionTest {
-        selectors: Vec<RegionSelector>,
-    },
-    Edit {
-        change: Change,
-        #[serde(default)]
-        patch_out: Option<std::path::PathBuf>,
-    },
-    Import {
-        source: Destination,
-        #[serde(default)]
-        patch_out: Option<std::path::PathBuf>,
-    },
-    Generate {
-        destination: Destination,
-        #[serde(default, rename = "where")]
-        filter: Option<Expression>,
-        #[serde(default)]
-        patch_out: Option<std::path::PathBuf>,
-    },
-    Apply {
-        patch: Patch,
-    },
+pub fn at<T: serde::de::DeserializeOwned>(input: &Value, pointer: &str) -> Result<T> {
+    let value = input
+        .pointer(pointer)
+        .with_context(|| format!("JSON Pointer {pointer:?} does not select a value"))?;
+    serde_json::from_value(value.clone())
+        .with_context(|| format!("invalid value at JSON Pointer {pointer:?}"))
 }
 
-#[derive(Debug, Serialize)]
-pub struct Response {
-    pub schema: u32,
-    pub ok: bool,
-    pub complete: bool,
-    pub observations: BTreeMap<String, Observation>,
-    pub diagnostics: Vec<Diagnostic>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-    #[serde(skip)]
-    pub exit_code: u8,
-}
-
-impl Response {
-    pub fn error(error: impl std::fmt::Display) -> Self {
-        Self {
-            schema: 1,
-            ok: false,
-            complete: false,
-            observations: BTreeMap::new(),
-            diagnostics: Vec::new(),
-            data: None,
-            error: Some(error.to_string()),
-            exit_code: 2,
-        }
+pub async fn links(engine: &mut Engine<'_>) -> Result<Vec<Link>> {
+    let links = engine.session.sidecar().await?.data.links.clone();
+    let mut canonical = Vec::with_capacity(links.len());
+    for link in links {
+        canonical.push(sidecar::canonical_link(&engine.session.workspace, link).await?);
     }
+    Ok(canonical)
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct UnknownMatch {
-    pub link: Link,
-    pub reason: String,
+/// Expand and normalize a Target, then resolve its RegionSelector to a Region.
+async fn resolve_target(
+    engine: &mut Engine<'_>,
+    target: &Target,
+) -> Result<(RegionSelector, Region)> {
+    let selector = sidecar::canonical_selector(&engine.session.workspace, target).await?;
+    let region = engine.resolve(&selector).await?;
+    Ok((selector, region))
 }
 
-#[derive(Clone, Debug, Serialize)]
-pub struct Selection {
-    pub links: Vec<Link>,
-    pub origins: Vec<Origin>,
-    pub observations: BTreeMap<String, Observation>,
-    pub undetermined: Vec<UnknownMatch>,
-    pub complete: bool,
-    pub diagnostics: Vec<Diagnostic>,
-}
-
-pub async fn select(engine: &mut Engine<'_>, filter: Option<&Expression>) -> Result<Selection> {
-    if let Some(filter) = filter {
-        filter.validate()?;
-    }
-    let sidecar = engine.session.sidecar().await?.data.clone();
-    let mut result = Selection {
-        links: Vec::new(),
-        origins: Vec::new(),
-        observations: BTreeMap::new(),
-        undetermined: Vec::new(),
-        complete: true,
-        diagnostics: Vec::new(),
-    };
-    for link in sidecar.links {
-        tokio::task::yield_now().await;
-        match match filter {
-            Some(filter) => filter.evaluate(engine, &link).await,
-            None => Ok(true),
-        } {
-            Ok(true) => result.links.push(link),
-            Ok(false) => {}
-            Err(error) => result.undetermined.push(UnknownMatch {
-                link,
-                reason: format!("{error:#}"),
-            }),
-        }
-    }
-    let ids: BTreeSet<_> = result
-        .links
-        .iter()
-        .map(|link| &link.id)
-        .chain(result.undetermined.iter().map(|item| &item.link.id))
-        .collect();
-    result.origins = sidecar
-        .origins
+fn observations<'a>(
+    engine: &Engine<'_>,
+    regions: impl IntoIterator<Item = &'a Region>,
+) -> BTreeMap<String, Observation> {
+    let ids: BTreeSet<_> = regions
         .into_iter()
-        .filter(|origin| ids.contains(&origin.link))
+        .flat_map(|region| &region.observations)
         .collect();
-    for origin in &result.origins {
-        result
-            .observations
-            .entry(origin.observation.clone())
-            .or_insert_with(|| sidecar.observations[&origin.observation].clone());
-    }
-    result.complete = result.undetermined.is_empty();
-    Ok(result)
+    ids.into_iter()
+        .map(|id| (id.clone(), engine.session.observation(id).clone()))
+        .collect()
+}
+
+pub async fn read(engine: &mut Engine<'_>, input: Value, pointer: &str) -> Result<Value> {
+    let endpoint: LinkEnd = at(&input, pointer)?;
+    let (selector, region) = resolve_target(engine, &endpoint.target).await?;
+    Ok(
+        json!({"input":input, "selector":selector, "observations":observations(engine, [&region]), "region":region}),
+    )
+}
+
+pub async fn compare(
+    engine: &mut Engine<'_>,
+    input: Value,
+    left: &str,
+    right: &str,
+) -> Result<Value> {
+    let left: LinkEnd = at(&input, left)?;
+    let right: LinkEnd = at(&input, right)?;
+    let (_, left) = resolve_target(engine, &left.target)
+        .await
+        .context("left Target")?;
+    let (_, right) = resolve_target(engine, &right.target)
+        .await
+        .context("right Target")?;
+    let relation = engine.compare(&left, &right).await?;
+    Ok(
+        json!({"input":input, "relation":relation, "observations":observations(engine, [&left, &right])}),
+    )
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -168,303 +92,268 @@ pub enum CheckStatus {
 }
 
 #[derive(Debug, Serialize)]
-pub struct LinkFindings {
-    pub id: String,
+pub struct Findings {
     pub extension: String,
     pub findings: Vec<CheckFinding>,
 }
 
-#[derive(Debug, Serialize)]
-pub struct CheckResult {
+#[derive(Serialize)]
+pub struct CaptureCheck {
+    pub id: String,
+    pub changed: bool,
+}
+
+#[derive(Serialize)]
+pub struct Checked {
+    pub input: Value,
     pub valid: bool,
-    pub selection: Selection,
-    pub findings: Vec<LinkFindings>,
-    pub duplicates: Vec<[String; 2]>,
+    pub source: Endpoint,
+    pub target: Endpoint,
+    pub findings: Vec<Findings>,
+    pub duplicates: Vec<String>,
+    pub captures: BTreeMap<String, CaptureCheck>,
+    pub observations: BTreeMap<String, Observation>,
+    #[serde(skip)]
+    pub link: Link,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct CheckRegionInput {
-    name: String,
-    target: Target,
-}
-
-pub async fn check(
-    engine: &mut Engine<'_>,
-    filter: Option<&Expression>,
-    inspect_duplicates: bool,
-) -> Result<CheckResult> {
-    let mut selection = select(engine, filter).await?;
+pub async fn check(engine: &mut Engine<'_>, input: Value, pointer: &str) -> Result<Checked> {
+    let link = sidecar::canonical_link(&engine.session.workspace, at(&input, pointer)?).await?;
+    // Validate every baseline before interpreting either endpoint.
+    let mut baselines = BTreeMap::new();
+    for (name, endpoint) in [("source", &link.source), ("target", &link.target)] {
+        if let Some(id) = &endpoint.capture {
+            let capture = crate::storage::capture(&engine.session.workspace, id).await?;
+            let selector =
+                sidecar::canonical_selector(&engine.session.workspace, &endpoint.target).await?;
+            ensure!(
+                capture.selector == selector,
+                "Link {} {name} selector does not match Capture {id}; review and capture this endpoint again",
+                link.id
+            );
+            baselines.insert(name, (id.clone(), capture));
+        }
+    }
+    let (selector, region) = resolve_target(engine, &link.source.target)
+        .await
+        .with_context(|| format!("Link {} source", link.id))?;
+    let source = Endpoint { selector, region };
+    let (selector, region) = resolve_target(engine, &link.target.target)
+        .await
+        .with_context(|| format!("Link {} target", link.id))?;
+    let target = Endpoint { selector, region };
+    let observed = observations(engine, [&source.region, &target.region]);
+    let mut captures = BTreeMap::new();
+    for (name, endpoint) in [("source", &source), ("target", &target)] {
+        if let Some((id, capture)) = baselines.remove(name) {
+            captures.insert(
+                name.to_owned(),
+                CaptureCheck {
+                    id,
+                    changed: capture.region.content != endpoint.region.content,
+                },
+            );
+        }
+    }
     let mut findings = Vec::new();
-    let checkers = engine.session.workspace.config.checks.clone();
-    for link in &selection.links {
-        let source = Endpoint::resolve(engine, link.source.clone()).await;
-        let target = match link
-            .reference
-            .target
-            .expand(&engine.session.workspace.config.names)
-        {
-            Ok(selector) => Endpoint::resolve(engine, selector).await,
-            Err(error) => Endpoint::Unresolved {
-                selector: None,
-                error: format!("{error:#}"),
-            },
-        };
-        let mut endpoints = Vec::new();
-        for (name, endpoint) in [("source", &source), ("target", &target)] {
-            match endpoint {
-                Endpoint::Resolved { .. } => endpoints.push(CheckFinding {
-                    code: format!("{name}_resolved"),
-                    message: format!("{name} resolved"),
-                    status: CheckStatus::Pass,
-                }),
-                Endpoint::Unresolved { error, .. } => {
-                    selection.diagnostics.push(Diagnostic {
-                        stage: "resolve".into(),
-                        subject: format!("{}:{name}", link.id),
-                        message: error.clone(),
-                    });
-                }
-            }
-        }
-        findings.push(LinkFindings {
-            id: link.id.clone(),
-            extension: "core".into(),
-            findings: endpoints,
-        });
-        if source.region().is_err() || target.region().is_err() {
-            continue;
-        }
-        for checker in &checkers {
-            let result = (async {
-                let plan: Vec<CheckRegionInput> = serde_json::from_value(engine.call(
-                    &checker.extension,
-                    "check_plan",
-                    json!({"link": link, "source": source, "target": target, "options": checker.options}),
-                ).await?)
-                .context("invalid check_plan response")?;
-                let mut regions = BTreeMap::new();
-                for input in plan {
-                    ensure!(
-                        !regions.contains_key(&input.name),
-                        "duplicate check input name: {}",
-                        input.name
-                    );
-                    let selector = input.target.expand(&engine.session.workspace.config.names)?;
-                    let region = engine.resolve(&selector).await?;
-                    regions.insert(input.name, region);
-                }
-                serde_json::from_value(engine.call(
+    for checker in engine.session.workspace.config.checks.clone() {
+        let result = serde_json::from_value(
+            engine
+                .call(
                     &checker.extension,
                     "check",
-                    json!({"link": link, "source": source, "target": target, "options": checker.options, "regions": regions}),
-                ).await?)
-                .context("invalid check response")
-            }).await;
-            match result {
-                Ok(result) => findings.push(LinkFindings {
-                    id: link.id.clone(),
-                    extension: checker.extension.clone(),
-                    findings: result,
-                }),
-                Err(error) => selection.diagnostics.push(Diagnostic {
-                    stage: "check".into(),
-                    subject: format!("{}:{}", checker.extension, link.id),
-                    message: format!("{error:#}"),
-                }),
-            }
-        }
-    }
-    let mut duplicates = Vec::new();
-    if inspect_duplicates {
-        let all = engine.session.sidecar().await?.data.links.clone();
-        let selected: BTreeSet<_> = selection.links.iter().map(|link| &link.id).collect();
-        for (index, left) in all.iter().enumerate() {
-            for right in &all[index + 1..] {
-                if !(selected.contains(&left.id) || selected.contains(&right.id))
-                    || left.annotation != right.annotation
-                {
-                    continue;
-                }
-                let same = async {
-                    let left_source = engine.resolve(&left.source).await?;
-                    let right_source = engine.resolve(&right.source).await?;
-                    if engine.compare(&left_source, &right_source).await? != Relation::Equal {
-                        return Ok::<_, anyhow::Error>(false);
-                    }
-                    let names = &engine.session.workspace.config.names;
-                    let left_target = left.reference.target.expand(names)?;
-                    let right_target = right.reference.target.expand(names)?;
-                    let left_target = engine.resolve(&left_target).await?;
-                    let right_target = engine.resolve(&right_target).await?;
-                    Ok(engine.compare(&left_target, &right_target).await? == Relation::Equal)
-                }
-                .await;
-                match same {
-                    Ok(true) => duplicates.push([left.id.clone(), right.id.clone()]),
-                    Ok(false) => {}
-                    Err(error) => selection.diagnostics.push(Diagnostic {
-                        stage: "duplicate".into(),
-                        subject: format!("{}:{}", left.id, right.id),
-                        message: format!("{error:#}"),
-                    }),
-                }
-            }
-        }
-    }
-    selection.complete &= selection.diagnostics.is_empty();
-    let valid = selection.complete
-        && duplicates.is_empty()
-        && findings.iter().all(|group| {
-            group
-                .findings
-                .iter()
-                .all(|finding| finding.status != CheckStatus::Fail)
+                    json!({"link":link,"source":source,"target":target,"options":checker.options}),
+                )
+                .await?,
+        )
+        .context("invalid check response")?;
+        findings.push(Findings {
+            extension: checker.extension,
+            findings: result,
         });
-    Ok(CheckResult {
-        valid,
-        selection,
+    }
+    Ok(Checked {
+        valid: captures.values().all(|capture| !capture.changed)
+            && findings.iter().all(|group| {
+                group
+                    .findings
+                    .iter()
+                    .all(|finding| finding.status != CheckStatus::Fail)
+            }),
+        input,
+        source,
+        target,
         findings,
-        duplicates,
+        duplicates: Vec::new(),
+        captures,
+        observations: observed,
+        link,
     })
 }
 
-pub async fn execute(
-    workspace: Workspace,
-    operation: Operation,
-    host: &mut crate::extensions::process::Host,
-) -> Response {
-    if let Operation::Init = operation {
-        return match (async {
-            Ok::<_, anyhow::Error>(json!({"config": workspace.initialize().await?}))
-        })
-        .await
-        {
-            Ok(data) => Response {
-                schema: 1,
-                ok: true,
-                complete: true,
-                observations: BTreeMap::new(),
-                diagnostics: Vec::new(),
-                data: Some(data),
-                error: None,
-                exit_code: 0,
-            },
-            Err(error) => Response::error(format!("{error:#}")),
-        };
+/// Only compare supplied Links. Each endpoint has already been interpreted once.
+/// O(n²) comparator calls in the worst case; annotation groups skip irrelevant pairs.
+pub async fn duplicates(engine: &mut Engine<'_>, checked: &mut [Checked]) -> Result<()> {
+    let mut ids = BTreeSet::new();
+    let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    for (i, item) in checked.iter().enumerate() {
+        ensure!(
+            ids.insert(&item.link.id),
+            "duplicate input Link ID: {}",
+            item.link.id
+        );
+        groups
+            .entry(serde_json::to_string(&item.link.annotation)?)
+            .or_default()
+            .push(i);
     }
-    let mut engine = match Engine::new(Session::new(workspace), host) {
-        Ok(engine) => engine,
-        Err(error) => return Response::error(format!("{error:#}")),
-    };
-    let result: Result<(Value, bool, u8)> = (async {
-        Ok(match operation {
-            Operation::Init => unreachable!(),
-            Operation::Show { target } => {
-                let selector = target.expand(&engine.session.workspace.config.names)?;
-                let region = engine.resolve(&selector).await?;
-                (json!({"selector": selector, "region": region}), true, 0)
+    drop(ids);
+    for group in groups.values() {
+        for (position, &i) in group.iter().enumerate() {
+            for &j in &group[position + 1..] {
+                if engine
+                    .compare(&checked[i].source.region, &checked[j].source.region)
+                    .await?
+                    == Relation::Equal
+                    && engine
+                        .compare(&checked[i].target.region, &checked[j].target.region)
+                        .await?
+                        == Relation::Equal
+                {
+                    let id = checked[i].link.id.clone();
+                    checked[i].duplicates.push(checked[j].link.id.clone());
+                    checked[j].duplicates.push(id);
+                    checked[i].valid = false;
+                    checked[j].valid = false;
+                }
             }
-            Operation::Links { filter } => {
-                let selected = select(&mut engine, filter.as_ref()).await?;
-                let complete = selected.complete;
-                (
-                    serde_json::to_value(selected)?,
-                    complete,
-                    if complete { 0 } else { 2 },
-                )
-            }
-            Operation::Check { filter, duplicates } => {
-                let checked = check(&mut engine, filter.as_ref(), duplicates).await?;
-                let complete = checked.selection.complete;
-                let exit = if !complete {
-                    2
-                } else if checked.valid {
-                    0
-                } else {
-                    1
-                };
-                (serde_json::to_value(checked)?, complete, exit)
-            }
-            Operation::ExtensionList => (serde_json::to_value(engine.manifests().await?)?, true, 0),
-            Operation::ExtensionShow { name } => {
-                (serde_json::to_value(engine.manifest(&name).await?)?, true, 0)
-            }
-            Operation::ExtensionTest { selectors } => {
-                let report = extension_test::test_regions(&mut engine, &selectors).await?;
-                let complete = report.complete;
-                let exit = if !complete {
-                    2
-                } else if report.passed {
-                    0
-                } else {
-                    1
-                };
-                (serde_json::to_value(report)?, complete, exit)
-            }
-            Operation::Edit { change, patch_out } => {
-                let patch = editing::prepare(&mut engine, change).await?;
-                (finish_edit(&mut engine, patch, patch_out).await?, true, 0)
-            }
-            Operation::Import { source, patch_out } => {
-                let patch = editing::prepare_import(&mut engine, &source).await?;
-                (finish_edit(&mut engine, patch, patch_out).await?, true, 0)
-            }
-            Operation::Generate { destination, filter, patch_out } => {
-                let selected = select(&mut engine, filter.as_ref()).await?;
-                ensure!(selected.complete, "cannot generate an undetermined selection: {}", serde_json::to_string(&selected.undetermined)?);
-                let patch = editing::prepare_generation(&mut engine, &destination, &selected.links).await?;
-                (finish_edit(&mut engine, patch, patch_out).await?, true, 0)
-            }
-            Operation::Apply { patch } => (
-                json!({"patch": patch.id, "applied": true, "commit": editing::apply(&mut engine, &patch).await?}),
-                true,
-                0,
-            ),
-        })
-    }).await;
-    let mut response = match result {
-        Ok((data, complete, exit_code)) => Response {
-            schema: 1,
-            ok: true,
-            complete,
-            observations: BTreeMap::new(),
-            diagnostics: Vec::new(),
-            data: Some(data),
-            error: None,
-            exit_code,
-        },
-        Err(error) => Response::error(format!("{error:#}")),
-    };
-    response.observations = engine
-        .session
-        .observations
-        .into_values()
-        .map(|observation| (observation.id.clone(), observation))
-        .collect();
-    response.diagnostics = engine.session.failures.into_values().collect();
-    response
+        }
+    }
+    Ok(())
 }
 
-async fn finish_edit(
-    engine: &mut Engine<'_>,
-    patch: Patch,
-    patch_out: Option<std::path::PathBuf>,
-) -> Result<Value> {
-    if let Some(path) = patch_out {
-        let path = engine.session.workspace.root.join(path);
-        let mut bytes = serde_json::to_vec_pretty(&patch)?;
-        bytes.push(b'\n');
-        engine
-            .session
-            .workspace
-            .publish_new(&path, &bytes)
-            .await
-            .context("save patch (destination must not exist)")?;
-        Ok(json!({"patch": patch, "path": path, "applied": false}))
-    } else {
-        Ok(
-            json!({"patch": patch.id, "applied": true, "commit": editing::apply(engine, &patch).await?}),
-        )
+/// Read a stored result without expansion, observation, or extension processes.
+pub async fn read_captured(engine: &Engine<'_>, input: Value, pointer: &str) -> Result<Value> {
+    let value: Value = at(&input, pointer)?;
+    let id = match &value {
+        Value::String(id) => id.clone(),
+        Value::Object(object) if object.len() == 1 && object.contains_key("capture") => {
+            object["capture"]
+                .as_str()
+                .context("Capture ID must be a string")?
+                .to_owned()
+        }
+        Value::Object(_) => {
+            let endpoint: LinkEnd =
+                serde_json::from_value(value).context("invalid captured endpoint")?;
+            endpoint
+                .capture
+                .context("endpoint has no Capture; capture it first")?
+        }
+        _ => anyhow::bail!("captured read requires a Capture ID or endpoint"),
+    };
+    let capture = crate::storage::capture(&engine.session.workspace, &id).await?;
+    Ok(
+        json!({"input":input, "capture":id, "selector":capture.selector, "region":capture.region,
+        "observations":capture.observations, "captured_at":capture.captured_at}),
+    )
+}
+
+async fn capture_target(engine: &mut Engine<'_>, target: &Target) -> Result<(String, Capture)> {
+    let (selector, region) = resolve_target(engine, target).await?;
+    let capture = Capture {
+        selector,
+        observations: observations(engine, [&region]),
+        region,
+        captured_at: crate::workspace::timestamp(),
+    };
+    let id = crate::storage::save_capture(&engine.session.workspace, &capture).await?;
+    Ok((id, capture))
+}
+
+pub async fn capture(engine: &mut Engine<'_>, input: Value, pointer: &str) -> Result<Value> {
+    let endpoint: LinkEnd = at(&input, pointer)?;
+    let (id, capture) = capture_target(engine, &endpoint.target).await?;
+    Ok(
+        json!({"input":input, "capture":id, "selector":capture.selector, "region":capture.region,
+        "observations":capture.observations, "captured_at":capture.captured_at}),
+    )
+}
+
+pub async fn capture_link(engine: &mut Engine<'_>, id: &str, endpoints: &[&str]) -> Result<Value> {
+    let before = engine.session.sidecar().await?.clone();
+    let index = before
+        .data
+        .links
+        .iter()
+        .position(|link| link.id == id)
+        .with_context(|| format!("unknown Link ID: {id}"))?;
+    let link = &before.data.links[index];
+    let mut captures = Vec::new();
+    for endpoint in endpoints {
+        let end = match *endpoint {
+            "source" => &link.source,
+            "target" => &link.target,
+            _ => anyhow::bail!("invalid endpoint: {endpoint}"),
+        };
+        let (capture, _) = capture_target(engine, &end.target).await?;
+        captures.push(((*endpoint).to_owned(), capture));
     }
+    sidecar::record_captures(&engine.session.workspace, &before, index, &captures).await?;
+    engine.session.sidecar = None;
+    Ok(json!({"link":id, "captures":captures.into_iter().collect::<BTreeMap<_,_>>()}))
+}
+
+pub async fn refresh(
+    engine: &mut Engine<'_>,
+    resources: &[String],
+    all: bool,
+) -> Result<Vec<Observation>> {
+    use crate::workspace::ObservationPolicy;
+    let mut selected = BTreeSet::new();
+    if all {
+        for link in links(engine).await? {
+            for endpoint in [link.source, link.target] {
+                let selector =
+                    sidecar::canonical_selector(&engine.session.workspace, &endpoint.target)
+                        .await?;
+                if let Some(resource) = selector.resource
+                    && engine.session.workspace.observation_policy(&resource)
+                        == ObservationPolicy::Refreshed
+                {
+                    selected.insert(resource);
+                }
+            }
+        }
+    } else {
+        for resource in resources {
+            let resource = engine
+                .session
+                .workspace
+                .normalize_resource(resource)
+                .await?;
+            ensure!(
+                engine.session.workspace.observation_policy(&resource)
+                    == ObservationPolicy::Refreshed,
+                "Resource is not configured as refreshed: {resource}"
+            );
+            selected.insert(resource);
+        }
+    }
+    let mut observations = Vec::new();
+    for resource in selected {
+        let observation = engine.observe(&resource).await?;
+        crate::storage::save_observation(
+            &engine.session.workspace,
+            &observation,
+            engine.session.bytes(&observation)?,
+        )
+        .await?;
+        observations.push(observation);
+    }
+    // Adopt the batch only after every observation has succeeded.
+    if !observations.is_empty() {
+        crate::storage::adopt(&engine.session.workspace, &observations).await?;
+    }
+    Ok(observations)
 }

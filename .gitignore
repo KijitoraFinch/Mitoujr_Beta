@@ -1,6 +1,7 @@
 AGENTS.md
 target/
-.monika/
-.monika-sidecar.lock
 *.swp
 *.swo
+/.playground/
+/DEVELOPMENT_note.md
+__pycache__/

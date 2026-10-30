@@ -18,26 +18,6 @@ pub struct RegionSelector {
     pub query: Value,
 }
 
-impl RegionSelector {
-    /// The short spelling is a CLI convenience. The query remains extension-owned.
-    pub fn parse(input: &str) -> Result<Self> {
-        if input.trim_start().starts_with('{') {
-            return serde_json::from_str(input).context("invalid selector JSON");
-        }
-        let (extension, rest) = input
-            .split_once(':')
-            .context("selector must be EXTENSION:RESOURCE[#QUERY] or a JSON object")?;
-        ensure!(!extension.is_empty(), "selector extension is empty");
-        let (resource, query) = rest.split_once('#').unwrap_or((rest, ""));
-        ensure!(!resource.is_empty(), "selector resource is empty");
-        Ok(Self {
-            extension: extension.to_owned(),
-            resource: Some(resource.to_owned()),
-            query: Value::String(query.to_owned()),
-        })
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Target {
@@ -74,18 +54,55 @@ impl Target {
     }
 }
 
+/// A Link endpoint keeps its Capture separate from the selector being expanded.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LinkEnd {
+    #[serde(flatten)]
+    pub target: Target,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture: Option<String>,
+}
+
+impl<'de> Deserialize<'de> for LinkEnd {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let mut value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object_mut()
+            .ok_or_else(|| serde::de::Error::custom("expected a Target object"))?;
+        let capture = object
+            .remove("capture")
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(serde::de::Error::custom)?;
+        let target = serde_json::from_value(value).map_err(serde::de::Error::custom)?;
+        Ok(Self { target, capture })
+    }
+}
+
+impl From<Target> for LinkEnd {
+    fn from(target: Target) -> Self {
+        Self {
+            target,
+            capture: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Reference {
-    pub target: Target,
+pub struct Capture {
+    pub selector: RegionSelector,
+    pub region: Region,
+    pub observations: BTreeMap<String, Observation>,
+    pub captured_at: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Link {
     pub id: String,
-    pub source: RegionSelector,
-    pub reference: Reference,
+    pub source: LinkEnd,
+    pub target: LinkEnd,
     #[serde(default)]
     pub annotation: Value,
 }
@@ -93,11 +110,12 @@ pub struct Link {
 impl Link {
     pub fn validate(&self) -> Result<()> {
         ensure!(!self.id.trim().is_empty(), "empty Link ID");
-        ensure!(!self.source.extension.is_empty(), "empty source extension");
-        match &self.reference.target {
-            Target::Named(named) => ensure!(!named.name.is_empty(), "empty named target"),
-            Target::RegionSelector(selector) => {
-                ensure!(!selector.extension.is_empty(), "empty target extension")
+        for target in [&self.source, &self.target] {
+            match &target.target {
+                Target::Named(named) => ensure!(!named.name.is_empty(), "empty named target"),
+                Target::RegionSelector(selector) => {
+                    ensure!(!selector.extension.is_empty(), "empty selector extension")
+                }
             }
         }
         Ok(())
@@ -229,7 +247,11 @@ mod tests {
                 .to_string()
                 .contains("unknown")
         );
-        let selector = RegionSelector::parse("md:doc.md#hello").unwrap();
+        let selector = RegionSelector {
+            extension: "md".into(),
+            resource: Some("doc.md".into()),
+            query: json!("hello"),
+        };
         names.insert("b".into(), Target::RegionSelector(selector.clone()));
         assert_eq!(named("a").expand(&names).unwrap(), selector);
         assert!(serde_json::from_value::<Target>(json!({"name":"a", "typo":1})).is_err());

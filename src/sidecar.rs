@@ -1,56 +1,24 @@
-use crate::model::{Link, Observation, Target, digest, require_version};
+use crate::model::{Link, Target, require_version};
 use crate::workspace::{Session, Workspace};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::value::RawValue;
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Write;
 
 pub const FILE_NAME: &str = "monika.links.json";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Origin {
-    pub link: String,
-    pub observation: String,
-    pub extension: String,
-    pub revision: String,
-    pub location: Value,
-}
-
-impl Origin {
-    pub fn input_key(&self, observation: &Observation) -> Result<String> {
-        Ok(serde_json::to_string(&(
-            &self.link,
-            &self.extension,
-            &self.revision,
-            &self.location,
-            &observation.resource,
-            &observation.content_hash,
-            &observation.state,
-        ))?)
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Sidecar {
     pub version: u32,
-    pub revision: u64,
     pub links: Vec<Link>,
-    pub origins: Vec<Origin>,
-    #[serde(default)]
-    pub observations: BTreeMap<String, Observation>,
 }
 
 impl Default for Sidecar {
     fn default() -> Self {
         Self {
             version: 1,
-            revision: 0,
             links: Vec::new(),
-            origins: Vec::new(),
-            observations: BTreeMap::new(),
         }
     }
 }
@@ -59,121 +27,71 @@ impl Sidecar {
     pub fn validate(&self) -> Result<()> {
         require_version(self.version)?;
         let mut ids = BTreeSet::new();
-        let mut values = BTreeSet::new();
         for link in &self.links {
             link.validate()?;
             ensure!(ids.insert(&link.id), "duplicate Link ID: {}", link.id);
-            ensure!(
-                matches!(link.reference.target, Target::RegionSelector(_)),
-                "Sidecar must contain expanded RegionSelectors: {}",
-                link.id
-            );
-            ensure!(
-                values.insert(definition_key(link)?),
-                "duplicate Link definition: {}; use the existing Link",
-                link.id
-            );
         }
-        let mut origins = BTreeSet::new();
-        for (id, observation) in &self.observations {
-            ensure!(id == &observation.id, "Sidecar Observation ID mismatch");
-            observation.validate_metadata()?;
-        }
-        for origin in &self.origins {
-            ensure!(
-                self.observations.contains_key(&origin.observation),
-                "origin refers to missing Observation: {}",
-                origin.observation
-            );
-            ensure!(
-                ids.contains(&origin.link),
-                "origin refers to missing Link: {}",
-                origin.link
-            );
-            ensure!(
-                !origin.extension.is_empty() && !origin.revision.is_empty(),
-                "origin needs an extension and revision"
-            );
-            ensure!(
-                origins.insert(origin.input_key(&self.observations[&origin.observation])?),
-                "duplicate origin for {}",
-                origin.link
-            );
-        }
-        let used: BTreeSet<_> = self
-            .origins
-            .iter()
-            .map(|origin| &origin.observation)
-            .collect();
-        ensure!(
-            used.len() == self.observations.len(),
-            "unreferenced Observation metadata in Sidecar"
-        );
         Ok(())
-    }
-
-    pub fn order(&mut self) {
-        let used: BTreeSet<_> = self
-            .origins
-            .iter()
-            .map(|origin| &origin.observation)
-            .collect();
-        self.observations.retain(|id, _| used.contains(id));
-        self.links.sort_by(|a, b| a.id.cmp(&b.id));
-        self.origins
-            .sort_by_key(|origin| serde_json::to_string(origin).expect("serializable origin"));
     }
 }
 
 pub fn definition_key(link: &Link) -> Result<String> {
+    // Captures record confirmation times; they do not change a Link's meaning.
     Ok(serde_json::to_string(&(
-        &link.source,
-        &link.reference,
+        &link.source.target,
+        &link.target.target,
         &link.annotation,
     ))?)
 }
 
-pub async fn normalize(workspace: &Workspace, mut link: Link) -> Result<Link> {
+/// Expand names and normalize Resources without observing them.
+pub async fn canonical_link(workspace: &Workspace, mut link: Link) -> Result<Link> {
     link.validate()?;
-    let mut target = link.reference.target.expand(&workspace.config.names)?;
-    for selector in [&mut link.source, &mut target] {
-        if let Some(resource) = &selector.resource {
-            selector.resource = Some(workspace.resource(resource).await?);
-        }
+    for endpoint in [&mut link.source, &mut link.target] {
+        endpoint.target =
+            Target::RegionSelector(canonical_selector(workspace, &endpoint.target).await?);
     }
-    link.reference.target = Target::RegionSelector(target);
     Ok(link)
 }
 
-/// Sidecar contents and the hash used to check a proposed update.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+pub async fn canonical_selector(
+    workspace: &Workspace,
+    target: &Target,
+) -> Result<crate::model::RegionSelector> {
+    let mut selector = target.expand(&workspace.config.names)?;
+    ensure!(!selector.extension.is_empty(), "empty selector extension");
+    if let Some(resource) = &selector.resource {
+        selector.resource = Some(workspace.normalize_resource(resource).await?);
+    }
+    Ok(selector)
+}
+
+pub async fn validate(workspace: &Workspace, data: &Sidecar) -> Result<()> {
+    data.validate()?;
+    let mut definitions = BTreeSet::new();
+    for link in &data.links {
+        let canonical = canonical_link(workspace, link.clone()).await?;
+        ensure!(
+            definitions.insert(definition_key(&canonical)?),
+            "duplicate Link definition after expanding names and normalizing Resources: {}",
+            link.id
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug)]
 pub struct SidecarState {
-    pub content_hash: Option<String>,
+    pub text: String,
     pub data: Sidecar,
 }
 
 pub async fn read(workspace: &Workspace) -> Result<SidecarState> {
-    let path = workspace.root.join(FILE_NAME);
-    match tokio::fs::read(&path).await {
-        Ok(bytes) => {
-            let data: Sidecar =
-                serde_json::from_slice(&bytes).context("parse monika.links.json")?;
-            data.validate()?;
-            for link in &data.links {
-                ensure!(
-                    normalize(workspace, link.clone()).await? == *link,
-                    "Sidecar contains an unnormalized Link: {}",
-                    link.id
-                );
-            }
-            Ok(SidecarState {
-                content_hash: Some(digest(&bytes)),
-                data,
-            })
-        }
-        Err(error) => Err(error).context("read monika.links.json; initialize a new workspace with monika init, or restore its Sidecar"),
-    }
+    let text = tokio::fs::read_to_string(workspace.root.join(FILE_NAME)).await
+        .context("read monika.links.json; initialize a new workspace with monika init, or restore its Sidecar")?;
+    let data = serde_json::from_str(&text).context("parse monika.links.json")?;
+    validate(workspace, &data).await?;
+    Ok(SidecarState { text, data })
 }
 
 impl Session {
@@ -185,76 +103,47 @@ impl Session {
     }
 }
 
-/// Compare and replace under the standard library's OS lock. The temporary file
-/// is persisted atomically; the lock file itself stays in place between writes.
-pub async fn commit(workspace: &Workspace, before: &SidecarState, after: &Sidecar) -> Result<()> {
-    after.validate()?;
-    let unchanged = *after == before.data;
-    ensure!(
-        unchanged
-            || after.revision
-                == before
-                    .data
-                    .revision
-                    .checked_add(1)
-                    .context("Sidecar revision overflow")?,
-        "invalid Sidecar revision transition"
-    );
-    for link in &after.links {
-        ensure!(
-            normalize(workspace, link.clone()).await? == *link,
-            "patch contains an unnormalized Link: {}",
-            link.id
-        );
-    }
-    let path = workspace.root.join(FILE_NAME);
-    let lock_path = workspace.root.join(".monika-sidecar.lock");
-    let before = before.clone();
-    let mut bytes = serde_json::to_vec_pretty(after)?;
-    bytes.push(b'\n');
-    tokio::task::spawn_blocking(move || -> Result<()> {
-        let lock = std::fs::File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path)?;
-        lock.try_lock()
-            .context("another Sidecar write is in progress; retry after it finishes")?;
-        let metadata = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) => {
-                ensure!(
-                    metadata.is_file() && !metadata.is_symlink(),
-                    "Sidecar must be a regular file"
-                );
-                Some(metadata)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error).context("inspect Sidecar"),
-        };
-        let current = if metadata.is_some() {
-            Some(digest(&std::fs::read(&path)?))
+/// Edit only Capture values, retaining all other bytes, including escaped names,
+/// number spellings and whitespace. serde_json supplies validated source spans.
+pub async fn record_captures(
+    workspace: &Workspace,
+    before: &SidecarState,
+    link_index: usize,
+    captures: &[(String, String)],
+) -> Result<()> {
+    let root: BTreeMap<String, &RawValue> = serde_json::from_str(&before.text)?;
+    let links: Vec<&RawValue> = serde_json::from_str(root["links"].get())?;
+    let link: BTreeMap<String, &RawValue> = serde_json::from_str(links[link_index].get())?;
+    let mut edits = Vec::new();
+    for (end, id) in captures {
+        let endpoint = link[end].get();
+        let fields: BTreeMap<String, &RawValue> = serde_json::from_str(endpoint)?;
+        let encoded = serde_json::to_string(id)?;
+        let (start, len, replacement) = if let Some(value) = fields.get("capture") {
+            (
+                value.get().as_ptr() as usize - before.text.as_ptr() as usize,
+                value.get().len(),
+                encoded,
+            )
         } else {
-            None
+            (
+                endpoint.as_ptr() as usize - before.text.as_ptr() as usize + endpoint.len() - 1,
+                0,
+                format!(",\"capture\":{encoded}"),
+            )
         };
-        ensure!(
-            current == before.content_hash,
-            "Sidecar changed since the patch was prepared"
-        );
-        if unchanged {
-            return Ok(());
-        }
-        let mut staged =
-            tempfile::NamedTempFile::new_in(path.parent().context("Sidecar has no parent")?)?;
-        if let Some(metadata) = metadata {
-            staged.as_file().set_permissions(metadata.permissions())?;
-        }
-        staged.write_all(&bytes)?;
-        staged.as_file().sync_all()?;
-        staged.persist(&path).context("replace Sidecar")?;
-        #[cfg(unix)]
-        std::fs::File::open(path.parent().unwrap())?.sync_all()?;
-        Ok(())
-    })
-    .await?
+        edits.push((start, len, replacement));
+    }
+    edits.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    let mut text = before.text.clone();
+    for (start, len, replacement) in edits {
+        text.replace_range(start..start + len, &replacement);
+    }
+    validate(workspace, &serde_json::from_str(&text)?).await?;
+    let path = workspace.root.join(FILE_NAME);
+    ensure!(
+        tokio::fs::read_to_string(&path).await? == before.text,
+        "Sidecar changed while capturing; retry after reviewing it"
+    );
+    workspace.replace(&path, text.as_bytes()).await
 }
